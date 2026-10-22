@@ -221,9 +221,9 @@ static __device__ __forceinline__ float4 traceGaussians(
 
   // The difference in the output buffer is the result of this trace path
   float4 accumulated_radiance =
-      make_float4(rayData.radiance.x - prevRayData.radiance.x,
-                  rayData.radiance.y - prevRayData.radiance.y,
-                  rayData.radiance.z - prevRayData.radiance.z,
+      make_float4(rayData.features[0] - prevRayData.features[0],
+                  rayData.features[1] - prevRayData.features[1],
+                  rayData.features[2] - prevRayData.features[2],
                   rayData.density - prevRayData.density);
 
   return accumulated_radiance;

@@ -206,7 +206,7 @@ class Tracer:
         else:
             materials = [self.to_native_pbr_material(m) for m in materials]
         if envmap is None:
-            envmap = torch.zeros([4, 4, 4], dtype=torch.float32)
+            envmap = torch.zeros([4, 4, 4], dtype=torch.float32, device="cuda")
         if envmap_offset is None:
             envmap = torch.zeros([2], dtype=torch.float32)
 

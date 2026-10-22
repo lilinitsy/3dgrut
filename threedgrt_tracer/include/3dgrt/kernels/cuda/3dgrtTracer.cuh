@@ -38,7 +38,7 @@ struct RayHit {
 using RayPayload = RayHit[PipelineParameters::MaxNumHitPerTrace];
 
 struct RayData {
-    float features[RAY_FEATURE_DIM];
+    FixedArray<float, RAY_FEATURE_DIM> features;
 
     float density;
     float3 normal;
@@ -152,7 +152,8 @@ static __device__ __inline__ void traceVolumetricGS(
     minMaxT.y              = fminf(minMaxT.y, tmax);
     constexpr float epsT   = 1e-9;
 
-    float rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
+    float rayLastHitDistance     = fmaxf(0.0f, minMaxT.x - epsT);
+    float3 canonicalIntersection = make_float3(0.f);
     RayPayload rayPayload;
 
     while ((rayLastHitDistance <= minMaxT.y) && (rayTransmittance > params.minTransmittance)) {
@@ -173,22 +174,22 @@ static __device__ __inline__ void traceVolumetricGS(
                     {{(gaussianParticle_RawParameters_0*)params.particleDensity, nullptr, true}},
                     &rayTransmittance,
                     &rayData.hitDistance,
+                    &canonicalIntersection,
 #ifdef ENABLE_NORMALS
-                    true, &rayData->normal
+                    true, &rayData.normal
 #else
                     false, nullptr
 #endif
                 );
 
-                // Call generic Slang wrapper (no conditionals)
-                // The wrapper handles CommonParameters construction internally
-                particleFeaturesIntegrateFwdGeneric(
+                particleFeaturesIntegrateFwdFromBuffer(
                     rayDirection,
+                    canonicalIntersection,
                     hitWeight,
                     rayHit.particleId,
-                    params.particleFeatures, // void* - generic buffer pointer
-                    params.sphDegree,        // auxiliary parameter (sphDegree for SH, unused for learned)
-                    rayData.features);       // float* - generic output array
+                    const_cast<TParticleFeatureElem*>(params.particleFeatures),
+                    params.sphDegree,
+                    &rayData.features);
 
                 rayLastHitDistance = fmaxf(rayLastHitDistance, rayHit.distance);
 
