@@ -123,8 +123,12 @@ public:
                      const std::vector<CPBRMaterial> &materials,
                      cudaStream_t cudaStream);
 
+  // Returns (rayRad, rayDns, rayHit, rayNrm, rayHitsCount, aovFirstHitT,
+  // aovFirstNormal, aovFirstPrimType, aovFirstHitTransmittance, aovNumBounces,
+  // aovGaussDepth)
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-             torch::Tensor>
+             torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+             torch::Tensor, torch::Tensor, torch::Tensor>
   traceHybrid(uint32_t frameNumber, torch::Tensor rayToWorld,
               torch::Tensor rayOri, torch::Tensor rayDir,
               torch::Tensor particleDensity, torch::Tensor particleFeatures,
@@ -136,7 +140,8 @@ public:
               const std::vector<CPBRMaterial> &materials,
               bool shouldSyncMaterials, torch::Tensor refractiveIndex,
               torch::Tensor envmap, torch::Tensor envmapOffset,
-              const unsigned int maxPBRBounces);
+              const unsigned int maxPBRBounces, torch::Tensor rayPixelId,
+              torch::Tensor raySampleIndex);
 
   torch::Tensor denoise(torch::Tensor rayRad);
 };

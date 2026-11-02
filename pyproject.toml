@@ -78,6 +78,10 @@ playground = [
     "pygltflib",
     "kaolin>=0.17.0",
 ]
+adaptive = [
+    "flip-evaluator>=1.7",
+    "matplotlib",
+]
 
 [tool.setuptools]
 include-package-data = true
@@ -109,6 +113,7 @@ torchvision = { index = "pytorch" }
 torchmetrics = { index = "pypi" }
 setuptools = { index = "pypi" }
 ninja = { index = "pypi" }
+flip-evaluator = { index = "pypi" }
 
 [[tool.uv.index]]
 name = "pypi"

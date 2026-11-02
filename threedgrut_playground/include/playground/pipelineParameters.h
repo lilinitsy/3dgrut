@@ -80,4 +80,17 @@ struct PlaygroundPipelineParameters : PipelineParameters {
   PackedTensorAccessor32<int32_t, 2> primType; // see PlaygroundPrimitiveTypes
   PackedTensorAccessor32<float, 2>
       refractiveIndex; // glass refraction, higher -> thicker glass
+
+  // [B,H,W] per-ray RNG ids; valid only if useRayIds
+  PackedTensorAccessor32<int32_t, 3> rayPixelId;
+  PackedTensorAccessor32<int32_t, 3> raySampleIndex;
+  unsigned int useRayIds;
+
+  // [B,H,W,C] per-ray AOV outputs, written once at the end of __raygen__rg
+  PackedTensorAccessor32<float, 4> aovFirstHitT;   // C=1, -1 if no hit
+  PackedTensorAccessor32<float, 4> aovFirstNormal; // C=3, zeros if no hit
+  PackedTensorAccessor32<float, 4> aovFirstHitTransmittance; // C=1
+  PackedTensorAccessor32<float, 4> aovGaussDepth;            // C=1
+  PackedTensorAccessor32<int32_t, 4> aovFirstPrimType;       // C=1, 0 if no hit
+  PackedTensorAccessor32<int32_t, 4> aovNumBounces;          // C=1
 };

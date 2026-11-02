@@ -52,7 +52,12 @@ extern "C" __global__ void __raygen__rg() {
   payload.rayOri = make_float3(rayOrigin.x, rayOrigin.y, rayOrigin.z);
   payload.rayDir = make_float3(rayDirection.x, rayDirection.y, rayDirection.z);
   payload.numBounces = 0;
-  payload.rndSeed = tea<16>(dim.x * idx.y + idx.x, params.frameNumber);
+  if (params.useRayIds) {
+    const uint2 ids = getRayIds();
+    payload.rndSeed = tea<16>(ids.x, ids.y);
+  } else {
+    payload.rndSeed = tea<16>(dim.x * idx.y + idx.x, params.frameNumber);
+  }
   const float ray_t_max = params.rayMaxT[idx.z][ry][rx];
   // Initialize Payload PBR fields
   payload.accumulatedColor = make_float3(0.0);
@@ -62,6 +67,14 @@ extern "C" __global__ void __raygen__rg() {
   payload.bsdfValue = make_float3(1.0);
   payload.pbrNumBounces = 0;
   payload.rayMissed = false;
+  // Initialize AOVs to their "no hit" sentinels
+  payload.aovHasFirstHit = false;
+  payload.aovFirstHitT = -1.0f;
+  payload.aovFirstNormal = make_float3(0.0f);
+  payload.aovFirstPrimType = 0;
+  payload.aovNumRedirections = 0;
+  float aovGaussDepth = 0.0f;
+  float aovFirstHitTransmittance = 0.0f;
 
   // Initialize 3drt output buffers, we'll soon aggregate in them
   RayData rayData;
@@ -98,6 +111,10 @@ extern "C" __global__ void __raygen__rg() {
     // Trace the ray against BVH of reflective / refractive faces
     traceMesh(rayOri, rayDir, &payload);
 
+    // snapshot of densities before traceGaussians
+    const float preSegDensity = rayData.density;
+    const float preSegHitDistance = rayData.hitDistance;
+
     // Then perform volumetric radiance integration from ray origin to closest
     // hit point (or infinity is ray missed)
     float next_ray_t = payload.rayMissed ? ray_t_max : payload.t_hit;
@@ -106,6 +123,14 @@ extern "C" __global__ void __raygen__rg() {
     float3 radiance =
         make_float3(volumetricRadDns.x, volumetricRadDns.y, volumetricRadDns.z);
     float density = volumetricRadDns.w;
+    if (timeout == 0)
+    {
+      const bool diffuseFirst = payload.aovHasFirstHit && payload.aovFirstPrimType == PGRNDPrimitiveDiffuse;
+      const float segDensity = diffuseFirst ? preSegDensity : rayData.density;
+      const float segHitDistance = diffuseFirst ? preSegHitDistance : rayData.hitDistance;
+      aovGaussDepth = (segDensity > 0.0f) ? (segHitDistance / segDensity) : 0.0f;
+      aovFirstHitTransmittance = payload.aovHasFirstHit ? (1.0f - segDensity) : 0.0f;
+    }
 
     // -- Now accumulate the radiance collected along this path:
     // TODO (operel): The following will not suffice for pbr primitives with
@@ -154,6 +179,7 @@ extern "C" __global__ void __raygen__rg() {
 
   writeRadianceDensityToOutputBuffer(rgba);
   writeUpdatedRaysToBuffer(lastRayOri, lastRayDir);
+  writeAovsToBuffer(payload, aovGaussDepth, aovFirstHitTransmittance);
 }
 
 static __device__ __inline__ bool refract(float3 &out_dir, const float3 ray_d,
@@ -311,6 +337,18 @@ extern "C" __global__ void __closesthit__ch() {
   auto intersected_type =
       params.primType[triId][0]; // Primitive type that we hit
 
+  // AOVs: the first CH call always comes from the input ray
+  if (!payload->aovHasFirstHit)
+  {
+    payload->aovHasFirstHit = true;
+  
+    // Taken before handleGlass adds REFRACTION_EPS_SHIFT
+    payload->aovFirstHitT = hit_t;
+    payload->aovFirstNormal = normal;
+    payload->aovFirstPrimType = intersected_type;
+  }
+  const unsigned int pbrBouncesBefore = payload->pbrNumBounces;
+
   float3 new_ray_dir =
       make_float3(0.0, 0.0, 0.0); // Will hold new redirected ray direction
   unsigned int next_render_pass =
@@ -332,6 +370,12 @@ extern "C" __global__ void __closesthit__ch() {
   else
     new_ray_dir = ray_d; // Do nothing
 
+  // AOV redirection count: Mirror / Glass hits, PBR hits that sampled a BSDF
+  if (intersected_type == PGRNDPrimitiveMirror || intersected_type == PGRNDPrimitiveGlass || (intersected_type == PGRNDPrimitivePBR && payload->pbrNumBounces > pbrBouncesBefore))
+  {
+    payload->aovNumRedirections += 1;
+  }
+  
   // -- Write outputs to payload --
   // Intersection point - also determines origin of next ray
   payload->t_hit = hit_t;

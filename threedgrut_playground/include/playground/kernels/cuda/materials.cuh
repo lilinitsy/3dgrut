@@ -252,8 +252,15 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
 
   // Stochastic variables
   const uint3 idx = optixGetLaunchIndex();
-  const float3 rand = rnd_pcg3d(
-      make_uint3(idx.x, idx.y, getFrameNumber() + payload->pbrNumBounces));
+  uint3 rngKey;
+  if (params.useRayIds) {
+    const uint2 ids = getRayIds();
+    rngKey = make_uint3(ids.x, ids.y, payload->pbrNumBounces);
+  } else {
+    rngKey =
+        make_uint3(idx.x, idx.y, getFrameNumber() + payload->pbrNumBounces);
+  }
+  const float3 rand = rnd_pcg3d(rngKey);
   //     const float3 rand = rnd3(rndSeed);   // Enable for an alternative
   //     randomization procedure
   const float random_phi_seed = rand.x;

@@ -315,7 +315,8 @@ void HybridOptixTracer::syncMaterials(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor>
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor>
 HybridOptixTracer::traceHybrid(
     uint32_t frameNumber, torch::Tensor rayToWorld, torch::Tensor rayOri,
     torch::Tensor rayDir, torch::Tensor particleDensity,
@@ -325,7 +326,8 @@ HybridOptixTracer::traceHybrid(
     torch::Tensor primType, torch::Tensor matUV, torch::Tensor matID,
     const std::vector<CPBRMaterial> &materials, bool shouldSyncMaterials,
     torch::Tensor refractiveIndex, torch::Tensor envmap,
-    torch::Tensor envmapOffset, const unsigned int maxPBRBounces) {
+    torch::Tensor envmapOffset, const unsigned int maxPBRBounces,
+    torch::Tensor rayPixelId, torch::Tensor raySampleIndex) {
 
   // ----- 3dgrt launch params -----
   const torch::TensorOptions opts =
@@ -344,6 +346,13 @@ HybridOptixTracer::traceHybrid(
       torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
   torch::Tensor traceState = torch::zeros(
       {rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, int_opts);
+  // Per-ray AOVs: every launch slot writes all of them, so empty is safe
+  torch::Tensor aovFirstHitT = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
+  torch::Tensor aovFirstNormal = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
+  torch::Tensor aovFirstPrimType = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, int_opts);
+  torch::Tensor aovFirstHitTransmittance = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
+  torch::Tensor aovNumBounces = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, int_opts);
+  torch::Tensor aovGaussDepth = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
 
   PlaygroundPipelineParameters paramsHost;
   paramsHost.handle = _state->gasHandle;
@@ -390,6 +399,15 @@ HybridOptixTracer::traceHybrid(
   paramsHost.playgroundOpts = playgroundOpts;
   paramsHost.triHandle = _playgroundState->gasHandle;
   paramsHost.trace_state = packed_accessor32<int32_t, 4>(traceState);
+  paramsHost.useRayIds = rayPixelId.numel() > 0 ? 1u : 0u;
+  paramsHost.rayPixelId = packed_accessor32<int32_t, 3>(rayPixelId);
+  paramsHost.raySampleIndex = packed_accessor32<int32_t, 3>(raySampleIndex);
+  paramsHost.aovFirstHitT = packed_accessor32<float, 4>(aovFirstHitT);
+  paramsHost.aovFirstNormal = packed_accessor32<float, 4>(aovFirstNormal);
+  paramsHost.aovFirstPrimType = packed_accessor32<int32_t, 4>(aovFirstPrimType);
+  paramsHost.aovFirstHitTransmittance = packed_accessor32<float, 4>(aovFirstHitTransmittance);
+  paramsHost.aovNumBounces = packed_accessor32<int32_t, 4>(aovNumBounces);
+  paramsHost.aovGaussDepth = packed_accessor32<float, 4>(aovGaussDepth);
   CudaTexture2DFloat4Object cuEnvMap = CudaTexture2DFloat4Object();
   int envmapHeight = envmap.size(0);
   int envmapWidth = envmap.size(1);
@@ -426,8 +444,11 @@ HybridOptixTracer::traceHybrid(
   CUDA_CHECK_LAST();
 
   return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                    torch::Tensor>(rayRad, rayDns, rayHit, rayNrm,
-                                   rayHitsCount);
+                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                    torch::Tensor, torch::Tensor, torch::Tensor>(
+                        rayRad, rayDns, rayHit, rayNrm, rayHitsCount, aovFirstHitT,
+                        aovFirstNormal, aovFirstPrimType, aovFirstHitTransmittance, aovNumBounces,
+                        aovGaussDepth);
 }
 
 torch::Tensor HybridOptixTracer::denoise(torch::Tensor rayRad) {

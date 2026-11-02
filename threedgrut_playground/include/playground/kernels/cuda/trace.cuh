@@ -65,6 +65,13 @@ struct HybridRayPayload {
   float3 nextEmissive; // Light emitted due to last PBR surface hit
                        // recomputed each iteration
   bool rayMissed;      // True if ray missed the mesh primitives
+
+  // Per-ray AOVs, captured in __closesthit__ch
+  bool aovHasFirstHit;   // True once the first closest hit was recorded
+  float aovFirstHitT;    // t of the first hit (before any eps shift), or -1
+  float3 aovFirstNormal; // normal at the first hit, or zeros
+  int aovFirstPrimType;  // primitive type of the first hit, or 0 (None)
+  unsigned int aovNumRedirections; // Mirror / Glass hits + PBR BSDF samples
 };
 
 constexpr float epsT = 1e-9; // Minimal offset to ray t to avoid zero t
@@ -110,6 +117,19 @@ setNextTraceState(unsigned int traceState) {
   const int ry =
       fminf(idx.y, params.frameBounds.y); // Ray coordinates in pixels
   params.trace_state[idx.z][ry][rx][0] = traceState;
+}
+
+// Per-ray RNG ids (pixelId, sampleIndex), bit-cast to unsigned.
+// Valid only if params.useRayIds.
+static __device__ __forceinline__ uint2 getRayIds() {
+  const uint3 idx = optixGetLaunchIndex();
+  const int rx =
+      fminf(idx.x, params.frameBounds.x); // Ray coordinates in pixels
+  const int ry =
+      fminf(idx.y, params.frameBounds.y); // Ray coordinates in pixels
+  return make_uint2(
+      static_cast<unsigned int>(params.rayPixelId[idx.z][ry][rx]),
+      static_cast<unsigned int>(params.raySampleIndex[idx.z][ry][rx]));
 }
 
 static __device__ __forceinline__ void clearOutputBuffers() {
@@ -179,6 +199,25 @@ writeUpdatedRaysToBuffer(const float3 rayOri, const float3 rayDir) {
   params.rayDirection[idx.z][ry][rx][0] = rayDir.x;
   params.rayDirection[idx.z][ry][rx][1] = rayDir.y;
   params.rayDirection[idx.z][ry][rx][2] = rayDir.z;
+}
+
+static __device__ __forceinline__ void
+writeAovsToBuffer(const HybridRayPayload &payload, float gaussDepth,
+                  float firstHitTransmittance) {
+  const uint3 idx = optixGetLaunchIndex();
+  const int rx =
+      fminf(idx.x, params.frameBounds.x); // Ray coordinates in pixels
+  const int ry =
+      fminf(idx.y, params.frameBounds.y); // Ray coordinates in pixels
+  params.aovFirstHitT[idx.z][ry][rx][0] = payload.aovFirstHitT;
+  params.aovFirstNormal[idx.z][ry][rx][0] = payload.aovFirstNormal.x;
+  params.aovFirstNormal[idx.z][ry][rx][1] = payload.aovFirstNormal.y;
+  params.aovFirstNormal[idx.z][ry][rx][2] = payload.aovFirstNormal.z;
+  params.aovFirstPrimType[idx.z][ry][rx][0] = payload.aovFirstPrimType;
+  params.aovFirstHitTransmittance[idx.z][ry][rx][0] = firstHitTransmittance;
+  params.aovNumBounces[idx.z][ry][rx][0] =
+      static_cast<int32_t>(payload.aovNumRedirections);
+  params.aovGaussDepth[idx.z][ry][rx][0] = gaussDepth;
 }
 
 static __device__ __forceinline__ void

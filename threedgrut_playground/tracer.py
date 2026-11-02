@@ -15,6 +15,7 @@
 
 import logging
 import os
+from typing import Optional
 
 import torch
 import torch.utils.cpp_extension
@@ -42,6 +43,38 @@ def load_playground_plugin(conf):
 
 # ----------------------------------------------------------------------------
 #
+
+
+def _validate_ray_ids(
+    ray_o: torch.Tensor, ray_pixel_id: Optional[torch.Tensor], ray_sample_index: Optional[torch.Tensor]
+) -> bool:
+    """Validates the optional per-ray RNG key tensors of ``Tracer.render_playground``.
+
+    Returns False when both are None (default path) and True when both are valid. Raises ValueError otherwise.
+    Checks run in order: both-or-neither, is a tensor, dtype int32, shape == ray_o.shape[0:3], on CUDA, same device
+    as ray_o. This is the only dtype guard, because ``packed_accessor32`` does not check dtype.
+    """
+    if ray_pixel_id is None and ray_sample_index is None:
+        return False
+    if ray_pixel_id is None or ray_sample_index is None:
+        raise ValueError("ray_pixel_id and ray_sample_index must be given both or neither.")
+    for name, t in (("ray_pixel_id", ray_pixel_id), ("ray_sample_index", ray_sample_index)):
+        if not isinstance(t, torch.Tensor):
+            raise ValueError(f"{name} must be a torch.Tensor, got {type(t).__name__}.")
+    for name, t in (("ray_pixel_id", ray_pixel_id), ("ray_sample_index", ray_sample_index)):
+        if t.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype int32, got {t.dtype}.")
+    expected_shape = tuple(ray_o.shape[0:3])
+    for name, t in (("ray_pixel_id", ray_pixel_id), ("ray_sample_index", ray_sample_index)):
+        if tuple(t.shape) != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape} (ray_o.shape[0:3]), got {tuple(t.shape)}.")
+    for name, t in (("ray_pixel_id", ray_pixel_id), ("ray_sample_index", ray_sample_index)):
+        if not t.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got device {t.device}.")
+    for name, t in (("ray_pixel_id", ray_pixel_id), ("ray_sample_index", ray_sample_index)):
+        if t.device != ray_o.device:
+            raise ValueError(f"{name} must be on the same device as ray_o ({ray_o.device}), got {t.device}.")
+    return True
 
 
 class Tracer:
@@ -192,7 +225,58 @@ class Tracer:
         envmap=None,
         envmap_offset=None,
         max_pbr_bounces=7,
+        ray_pixel_id: Optional[torch.Tensor] = None,
+        ray_sample_index: Optional[torch.Tensor] = None,
     ):
+        """Traces the hybrid Gaussian + mesh scene with the playground path tracer.
+
+        ``ray_o`` and ``ray_d`` are ``[B,H,W,3]`` world-space rays; the kernel overwrites them with the last traced
+        ray (returned as ``last_ray_o`` / ``last_ray_d``), so callers must pass copies if they need them afterwards.
+        ``is_sync_materials`` is ignored by the host: ``traceHybrid`` always re-syncs ``materials`` (existing
+        behavior, documented here, not changed).
+
+        ``ray_pixel_id`` / ``ray_sample_index`` are optional int32 ``[B,H,W]`` CUDA tensors, given both or neither.
+        When given, every random draw of a ray (alpha test, PBR BSDF sampling) is keyed by its
+        ``(pixel_id, sample_index)`` only, independent of its launch slot, the batch layout and ``frame_id``. When
+        omitted, the RNG is keyed by launch index and ``frame_id`` exactly as before.
+
+        Besides ``pred_features``, ``pred_opacity``, ``pred_dist``, ``pred_normals``, ``hits_count``, ``last_ray_o``
+        and ``last_ray_d``, the returned dict always holds six per-ray AOVs ("first hit" is the first
+        ``__closesthit__ch`` call, which always comes from the input ray; the "first segment" is the input ray from
+        ``t=1e-9`` up to that hit, or up to ``ray_max_t`` on a miss):
+
+        ``aov_first_hit_t`` (f32 ``[B,H,W,1]``)
+            ``optixGetRayTmax()`` at the first hit, taken before glass adds ``REFRACTION_EPS_SHIFT``. ``-1.0`` if no
+            hit. The hit is geometric: it is recorded even when Gaussians hide the mesh, and
+            ``aov_first_hit_transmittance`` tells whether it is visible.
+        ``aov_first_normal`` (f32 ``[B,H,W,3]``)
+            The normal computed at the first hit: smooth interpolated if ``SMOOTH_NORMALS`` is set, else the hard face
+            normal. Not face-forwarded, no normal-map perturbation. Zeros if no hit.
+        ``aov_first_prim_type`` (i32 ``[B,H,W,1]``)
+            ``primitive_type`` of the first hit triangle; alpha-test pass-through hits count. ``0`` if no hit.
+        ``aov_first_hit_transmittance`` (f32 ``[B,H,W,1]``)
+            ``1 - density`` of the first segment's Gaussians if there is a hit, ``0.0`` if no hit. Exactly ``1.0``
+            when no Gaussian contributed (e.g. Gaussian tracing disabled).
+        ``aov_num_bounces`` (i32 ``[B,H,W,1]``)
+            Redirections along the whole path: +1 per Mirror or Glass hit (reflection and refraction), +1 per PBR hit
+            that sampled a BSDF direction. Diffuse, alpha pass-through and None hits add 0.
+        ``aov_gauss_depth`` (f32 ``[B,H,W,1]``)
+            Transmittance-weighted mean Gaussian hit distance of the first segment, ``hitDistance / density``
+            (``sum(w_i t_i) / sum(w_i)``), ``0`` if no Gaussian contributed.
+
+        Diffuse snapshot rule: a Diffuse first hit already integrates the first segment inside the closest-hit
+        program, and the ray-generation program then integrates it a second time (the Diffuse *color* keeps that
+        upstream double integration; it is not fixed here). ``aov_first_hit_transmittance`` and ``aov_gauss_depth``
+        use the single integration (a snapshot taken right after the mesh trace), so they match a Mirror or PBR hit
+        on the same segment.
+
+        Caveat, ``max_pbr_bounces=0``: the path loop never runs, so all six AOVs report their no-hit sentinels
+        (``-1``, zeros, ``0``, ``0.0``, ``0``, ``0``) even if a mesh is in view. This is accepted behavior.
+        """
+        use_ids = _validate_ray_ids(ray_o, ray_pixel_id, ray_sample_index)
+        if not use_ids:
+            ray_pixel_id = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
+            ray_sample_index = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
         if ray_max_t is None:
             ray_max_t = ray_o.new_full(size=ray_o.shape[0:3], fill_value=1e9)
         if refractive_index is None:
@@ -229,7 +313,19 @@ class Tracer:
             min_transmittance = self.conf.render.min_transmittance
             envmap_offset = envmap_offset.contiguous()
 
-            pred_features, pred_opacity, pred_dist, pred_normals, hits_count = self.tracer_wrapper.trace_hybrid(
+            (
+                pred_features,
+                pred_opacity,
+                pred_dist,
+                pred_normals,
+                hits_count,
+                aov_first_hit_t,
+                aov_first_normal,
+                aov_first_prim_type,
+                aov_first_hit_transmittance,
+                aov_num_bounces,
+                aov_gauss_depth,
+            ) = self.tracer_wrapper.trace_hybrid(
                 frame_id,
                 poses,
                 ray_o,
@@ -253,6 +349,8 @@ class Tracer:
                 envmap,
                 envmap_offset,
                 max_pbr_bounces,
+                ray_pixel_id,
+                ray_sample_index,
             )
 
             pred_dist = pred_dist[:, :, :, 0:1]  # return only the hit distance
@@ -265,6 +363,12 @@ class Tracer:
             "hits_count": hits_count,
             "last_ray_o": ray_o,  # Rewritten by tracer
             "last_ray_d": ray_d,  # Rewritten by tracer
+            "aov_first_hit_t": aov_first_hit_t,
+            "aov_first_normal": aov_first_normal,
+            "aov_first_prim_type": aov_first_prim_type,
+            "aov_first_hit_transmittance": aov_first_hit_transmittance,
+            "aov_num_bounces": aov_num_bounces,
+            "aov_gauss_depth": aov_gauss_depth,
         }
 
     @torch.cuda.nvtx.range("denoise")
