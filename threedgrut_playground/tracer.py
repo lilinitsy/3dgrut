@@ -106,8 +106,13 @@ class Tracer:
             self.conf.render.enable_hitcounts,
         )
 
-    def build_gs_acc(self, gaussians, rebuild=True):
+    def build_gs_acc(self, gaussians, rebuild=True, inflate=0.0):
+        """``inflate`` (world units) widens every proxy as if its Gaussian had std ``inflate`` added in quadrature, so
+        that cone tracing can find particles widened up to that std."""
         with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
+            scale = gaussians.scale_activation(gaussians.scale).view(-1, 3)
+            if inflate > 0.0:
+                scale = torch.sqrt(scale * scale + inflate * inflate)
             allow_bvh_update = (
                 self.conf.render.max_consecutive_bvh_update > 1
             ) and not self.conf.render.particle_kernel_density_clamping
@@ -119,7 +124,7 @@ class Tracer:
             self.tracer_wrapper.build_bvh(
                 gaussians.positions.view(-1, 3).contiguous(),
                 gaussians.rotation_activation(gaussians.rotation).view(-1, 4).contiguous(),
-                gaussians.scale_activation(gaussians.scale).view(-1, 3).contiguous(),
+                scale.contiguous(),
                 gaussians.density_activation(gaussians.density).view(-1, 1).contiguous(),
                 rebuild_bvh,
                 allow_bvh_update,
@@ -227,6 +232,7 @@ class Tracer:
         max_pbr_bounces=7,
         ray_pixel_id: Optional[torch.Tensor] = None,
         ray_sample_index: Optional[torch.Tensor] = None,
+        cone_params: Optional[torch.Tensor] = None,
     ):
         """Traces the hybrid Gaussian + mesh scene with the playground path tracer.
 
@@ -239,6 +245,9 @@ class Tracer:
         When given, every random draw of a ray (alpha test, PBR BSDF sampling) is keyed by its
         ``(pixel_id, sample_index)`` only, independent of its launch slot, the batch layout and ``frame_id``. When
         omitted, the RNG is keyed by launch index and ``frame_id`` exactly as before.
+
+        ``cone_params`` is a CPU float32 ``[3]`` tensor (camera ray spread, spread per unit GGX alpha, max cone std),
+        used only with the ``CONE_TRACING`` option. Zeros if omitted.
 
         Besides ``pred_features``, ``pred_opacity``, ``pred_dist``, ``pred_normals``, ``hits_count``, ``last_ray_o``
         and ``last_ray_d``, the returned dict always holds six per-ray AOVs ("first hit" is the first
@@ -277,6 +286,8 @@ class Tracer:
         if not use_ids:
             ray_pixel_id = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
             ray_sample_index = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
+        if cone_params is None:
+            cone_params = torch.zeros(3, dtype=torch.float32)
         if ray_max_t is None:
             ray_max_t = ray_o.new_full(size=ray_o.shape[0:3], fill_value=1e9)
         if refractive_index is None:
@@ -351,6 +362,7 @@ class Tracer:
                 max_pbr_bounces,
                 ray_pixel_id,
                 ray_sample_index,
+                cone_params.contiguous(),
             )
 
             pred_dist = pred_dist[:, :, :, 0:1]  # return only the hit distance

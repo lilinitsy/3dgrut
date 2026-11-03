@@ -93,4 +93,7 @@ struct PlaygroundPipelineParameters : PipelineParameters {
   PackedTensorAccessor32<float, 4> aovGaussDepth;            // C=1
   PackedTensorAccessor32<int32_t, 4> aovFirstPrimType;       // C=1, 0 if no hit
   PackedTensorAccessor32<int32_t, 4> aovNumBounces;          // C=1
+
+  // PGRNDRenderConeTracing: x = camera ray spread (rad, as a Gaussian std), y = spread added per unit GGX alpha, z = max cone std (world)
+  float3 coneParams;
 };

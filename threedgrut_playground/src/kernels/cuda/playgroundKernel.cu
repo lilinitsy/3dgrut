@@ -73,6 +73,9 @@ extern "C" __global__ void __raygen__rg() {
   payload.aovFirstNormal = make_float3(0.0f);
   payload.aovFirstPrimType = 0;
   payload.aovNumRedirections = 0;
+  payload.coneSigma = 0.0f;
+  payload.coneSpread = params.coneParams.x;
+  payload.coneSpreadAdd = 0.0f;
   float aovGaussDepth = 0.0f;
   float aovFirstHitTransmittance = 0.0f;
 
@@ -131,6 +134,11 @@ extern "C" __global__ void __raygen__rg() {
       aovGaussDepth = (segDensity > 0.0f) ? (segHitDistance / segDensity) : 0.0f;
       aovFirstHitTransmittance = payload.aovHasFirstHit ? (1.0f - segDensity) : 0.0f;
     }
+
+    // Move the cone to the next segment's origin, then widen it by the lobe of the surface hit there
+    payload.coneSigma += payload.coneSpread * payload.t_hit;
+    payload.coneSpread += payload.coneSpreadAdd;
+    payload.coneSpreadAdd = 0.0f;
 
     // -- Now accumulate the radiance collected along this path:
     // TODO (operel): The following will not suffice for pbr primitives with
@@ -251,8 +259,14 @@ static __device__ __inline__ void
 handlePBR(const float3 ray_o, const float3 ray_d, float3 normal,
           unsigned int &numBounces, float &hit_t, float3 &new_ray_dir,
           unsigned int &rndSeed, HybridRayPayload *payload) {
-  sampled_cook_torrance_brdf(ray_o, ray_d, hit_t, normal, new_ray_dir, rndSeed,
-                             payload);
+  if (params.playgroundOpts & PGRNDRenderConeTracing)
+  {
+    cone_cook_torrance_brdf(ray_d, normal, new_ray_dir, payload);
+  }
+  else
+  {
+    sampled_cook_torrance_brdf(ray_o, ray_d, hit_t, normal, new_ray_dir, rndSeed, payload);
+  }
   new_ray_dir = new_ray_dir / length(new_ray_dir);
 }
 

@@ -327,7 +327,8 @@ HybridOptixTracer::traceHybrid(
     const std::vector<CPBRMaterial> &materials, bool shouldSyncMaterials,
     torch::Tensor refractiveIndex, torch::Tensor envmap,
     torch::Tensor envmapOffset, const unsigned int maxPBRBounces,
-    torch::Tensor rayPixelId, torch::Tensor raySampleIndex) {
+    torch::Tensor rayPixelId, torch::Tensor raySampleIndex,
+    torch::Tensor coneParams) {
 
   // ----- 3dgrt launch params -----
   const torch::TensorOptions opts =
@@ -408,6 +409,8 @@ HybridOptixTracer::traceHybrid(
   paramsHost.aovFirstHitTransmittance = packed_accessor32<float, 4>(aovFirstHitTransmittance);
   paramsHost.aovNumBounces = packed_accessor32<int32_t, 4>(aovNumBounces);
   paramsHost.aovGaussDepth = packed_accessor32<float, 4>(aovGaussDepth);
+  const float *cone = coneParams.data_ptr<float>();
+  paramsHost.coneParams = make_float3(cone[0], cone[1], cone[2]);
   CudaTexture2DFloat4Object cuEnvMap = CudaTexture2DFloat4Object();
   int envmapHeight = envmap.size(0);
   int envmapWidth = envmap.size(1);

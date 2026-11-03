@@ -141,7 +141,7 @@ public:
               bool shouldSyncMaterials, torch::Tensor refractiveIndex,
               torch::Tensor envmap, torch::Tensor envmapOffset,
               const unsigned int maxPBRBounces, torch::Tensor rayPixelId,
-              torch::Tensor raySampleIndex);
+              torch::Tensor raySampleIndex, torch::Tensor coneParams);
 
   torch::Tensor denoise(torch::Tensor rayRad);
 };

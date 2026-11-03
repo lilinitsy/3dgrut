@@ -395,6 +395,26 @@ class Playground:
             )
             self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
 
+            settings_changed, self.engine.use_cone_tracing = psim.Checkbox(
+                "Cone Tracing (test)", self.engine.use_cone_tracing
+            )
+            self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+            if self.engine.use_cone_tracing:
+                psim.PushItemWidth(150)
+                settings_changed, self.engine.cone_roughness_scale = psim.SliderFloat(
+                    "Cone Spread per Alpha", self.engine.cone_roughness_scale, v_min=0.0, v_max=4.0
+                )
+                self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                settings_changed, self.engine.cone_max_sigma = psim.SliderFloat(
+                    "Cone Max Std (rebuilds BVH)",
+                    self.engine.cone_max_sigma,
+                    v_min=1e-4,
+                    v_max=1.0,
+                    flags=psim.ImGuiSliderFlags_Logarithmic,
+                )
+                self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                psim.PopItemWidth()
+
             psim.PopItemWidth()
             psim.TreePop()
 

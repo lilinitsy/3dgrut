@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import dataclass
 from enum import IntEnum
@@ -126,6 +127,7 @@ class OptixPlaygroundRenderOptions(IntEnum):
     SMOOTH_NORMALS = 1  # Use smooth interpolated normals for shading
     DISABLE_GAUSSIAN_TRACING = 2  # Disable Gaussian volumetric tracing
     DISABLE_PBR_TEXTURES = 4  # Disable PBR textures
+    CONE_TRACING = 8  # Rays carry cones; PBR reflections trace one widened cone
 
 
 class OptixPrimitiveTypes(IntEnum):
@@ -843,9 +845,17 @@ class Engine3DGRUT:
         self.disable_gaussian_tracing = False
 
         scene_scale = self.scene_mog.positions.max(dim=0)[0] - self.scene_mog.positions.min(dim=0)[0]
-        self.primitives = Primitives(
-            tracer=self.tracer, mesh_assets_folder=mesh_assets_folder, scene_scale=scene_scale, device=self.device
-        )
+        
+        # Cone tracing test: PBR reflections trace one cone along the mirror direction, widening the Gaussians
+        self.use_cone_tracing = False
+        
+        # Cone spread added per unit GGX alpha (sqrt(2): the reflected lobe is about twice the half-vector lobe)
+        self.cone_roughness_scale = 1.414
+        
+        # Largest cone std in world units; the Gaussian proxies are inflated by it while cone tracing is on. Cost grows steeply: on the 30k-step room, 0.005 is about 2x one MC sample per frame and 0.02 about 20x
+        self.cone_max_sigma = 0.005
+        self._gs_bvh_inflate = 0.0
+        self.primitives = Primitives(tracer=self.tracer, mesh_assets_folder=mesh_assets_folder, scene_scale=scene_scale, device=self.device)
         self.primitives.add_primitive(
             geometry_type="Sphere", primitive_type=OptixPrimitiveTypes.GLASS, device=self.device
         )
@@ -944,6 +954,16 @@ class Engine3DGRUT:
             playground_render_opts |= OptixPlaygroundRenderOptions.DISABLE_GAUSSIAN_TRACING
         if self.primitives.disable_pbr_textures:
             playground_render_opts |= OptixPlaygroundRenderOptions.DISABLE_PBR_TEXTURES
+        if self.use_cone_tracing:
+            playground_render_opts |= OptixPlaygroundRenderOptions.CONE_TRACING
+        bvh_inflate = self.cone_max_sigma if self.use_cone_tracing else 0.0
+        if bvh_inflate != self._gs_bvh_inflate:
+            self._gs_bvh_inflate = bvh_inflate
+            self.tracer.build_gs_acc(gaussians=mog, rebuild=True, inflate=bvh_inflate)
+        
+        # Camera rays start as a point with the std of a box pixel, width / sqrt(12)
+        pixel_spread = math.radians(self.camera_fov) / rays_o.shape[1] / math.sqrt(12.0)
+        cone_params = torch.tensor([pixel_spread, self.cone_roughness_scale, self.cone_max_sigma], dtype=torch.float32)
 
         self.primitives.rebuild_bvh_if_needed()
 
@@ -974,6 +994,7 @@ class Engine3DGRUT:
             envmap=envmap,
             envmap_offset=envmap_offset,
             max_pbr_bounces=self.max_pbr_bounces,
+            cone_params=cone_params,
         )
 
         pred_features = rendered_results["pred_features"]
@@ -1225,7 +1246,7 @@ class Engine3DGRUT:
             scene_mog (MixtureOfGaussians): The 3D Gaussian model whose BVH needs to be rebuilt
         """
         rebuild = True
-        self.tracer.build_gs_acc(gaussians=scene_mog, rebuild=rebuild)
+        self.tracer.build_gs_acc(gaussians=scene_mog, rebuild=rebuild, inflate=self._gs_bvh_inflate)
         self.primitives.rebuild_bvh_if_needed()
 
     def did_camera_change(self, camera: Camera) -> bool:

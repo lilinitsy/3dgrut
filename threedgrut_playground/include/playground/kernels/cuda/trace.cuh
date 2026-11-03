@@ -72,6 +72,12 @@ struct HybridRayPayload {
   float3 aovFirstNormal; // normal at the first hit, or zeros
   int aovFirstPrimType;  // primitive type of the first hit, or 0 (None)
   unsigned int aovNumRedirections; // Mirror / Glass hits + PBR BSDF samples
+
+  // Ray cone (PGRNDRenderConeTracing): Gaussian std at the segment origin, its growth per unit t, and the growth
+  // the last PBR hit adds once the cone reaches it
+  float coneSigma;
+  float coneSpread;
+  float coneSpreadAdd;
 };
 
 constexpr float epsT = 1e-9; // Minimal offset to ray t to avoid zero t
@@ -240,6 +246,59 @@ traceMesh(const float3 rayOri, const float3 rayDir, HybridRayPayload *payload) {
       p0, p1);
 }
 
+// Convolve a gaussian with an isotropic Gaussian. The density preserves the integral of the ray.
+static __device__ __inline__ void widenParticle(gaussianParticle_Parameters_0 &particle, const float3 &rayDirection, const float sigma)
+{
+  const float3 d = make_float3(dot(particle.rotationT_0.rows[0], rayDirection), dot(particle.rotationT_0.rows[1], rayDirection), dot(particle.rotationT_0.rows[2], rayDirection));
+  const float3 s2 = particle.scale_0 * particle.scale_0;
+  const float3 w2 = s2 + make_float3(sigma * sigma);
+  const float q = d.x * d.x / s2.x + d.y * d.y / s2.y + d.z * d.z / s2.z;
+  const float qWide = d.x * d.x / w2.x + d.y * d.y / w2.y + d.z * d.z / w2.z;
+  particle.density_0 *= sqrtf((s2.x / w2.x) * (s2.y / w2.y) * (s2.z / w2.z) * q / qWide);
+  particle.scale_0 = make_float3(sqrtf(w2.x), sqrtf(w2.y), sqrtf(w2.z));
+}
+
+// same as traceVolumetricGS, but with every particle widened by the cone stddev at its distance, capped at some coneParams.z value.
+static __device__ __inline__ void traceVolumetricGSCone(RayData &rayData, const float3 &rayOrigin, const float3 &rayDirection, const float tmin, const float tmax, const float coneSigma, const float coneSpread)
+{
+  float rayTransmittance = 1.0f - rayData.density;
+  float2 minMaxT = intersectAABB(params.aabb, rayOrigin, rayDirection);
+  minMaxT.x = fmaxf(minMaxT.x, tmin);
+  minMaxT.y = fminf(minMaxT.y, tmax);
+  float rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
+  float3 unusedNormal = make_float3(0.f);
+  RayPayload rayPayload;
+  while ((rayLastHitDistance <= minMaxT.y) && (rayTransmittance > params.minTransmittance))
+  {
+    trace(rayPayload, rayOrigin, rayDirection, rayLastHitDistance + epsT, minMaxT.y + epsT);
+    if (rayPayload[0].particleId == RayHit::InvalidParticleId)
+    {
+      break;
+    }
+#pragma unroll
+    for (int i = 0; i < PipelineParameters::MaxNumHitPerTrace; i++)
+    {
+      const RayHit rayHit = rayPayload[i];
+      if ((rayHit.particleId != RayHit::InvalidParticleId) && (rayTransmittance > params.minTransmittance))
+      {
+        gaussianParticle_Parameters_0 particle = particleDensityParameters(rayHit.particleId, {{(gaussianParticle_RawParameters_0 *)params.particleDensity, nullptr, true}});
+        const float t = fmaxf(dot(particle.position_0 - rayOrigin, rayDirection), 0.0f);
+        widenParticle(particle, rayDirection, fminf(coneSigma + coneSpread * t, params.coneParams.z));
+        float alpha, depth;
+        float3 canonicalIntersection;
+        if (particleDensityHit(rayOrigin, rayDirection, particle, &alpha, &depth, &canonicalIntersection, false, &unusedNormal))
+        {
+          const float hitWeight = particleDensityIntegrateHit(alpha, &rayTransmittance, depth, &rayData.hitDistance, false, unusedNormal, &unusedNormal);
+          particleFeaturesIntegrateFwdFromBuffer(rayDirection, canonicalIntersection, hitWeight, rayHit.particleId, const_cast<TParticleFeatureElem *>(params.particleFeatures), params.sphDegree, &rayData.features);
+        }
+        rayLastHitDistance = fmaxf(rayLastHitDistance, rayHit.distance);
+      }
+    }
+  }
+  rayData.density = 1 - rayTransmittance;
+  rayData.rayLastHitDistance = rayLastHitDistance;
+}
+
 static __device__ __forceinline__ float4 traceGaussians(
     RayData &rayData, const float3 &rayOrigin, const float3 &rayDirection,
     const float tmin, const float tmax, HybridRayPayload *payload) {
@@ -256,7 +315,14 @@ static __device__ __forceinline__ float4 traceGaussians(
   // Copy RayData, to avoid writing the output buffer by this pass
   RayData prevRayData = rayData;
   setNextTraceState(PGRNDTraceRTGaussiansPass);
-  traceVolumetricGS(rayData, rayOrigin, rayDirection, tmin, tmax);
+  if (params.playgroundOpts & PGRNDRenderConeTracing)
+  {
+    traceVolumetricGSCone(rayData, rayOrigin, rayDirection, tmin, tmax, payload->coneSigma, payload->coneSpread);
+  }
+  else
+  {
+    traceVolumetricGS(rayData, rayOrigin, rayDirection, tmin, tmax);
+  }
 
   // The difference in the output buffer is the result of this trace path
   float4 accumulated_radiance =

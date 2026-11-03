@@ -447,4 +447,26 @@ static __device__ __inline__ void sampled_cook_torrance_brdf(
   payload->nextEmissive = nextEmissive;
 }
 
+
+// One cone along the reflection direction instead of the ray. Weight is the specular lobe average.
+// Only materials are used here, no diffusion/transmission for now.
+static __device__ __noinline__ void cone_cook_torrance_brdf(const float3 ray_d, const float3 normal, float3 &new_ray_dir, HybridRayPayload *payload)
+{
+  const auto material = get_material(params.matID[optixGetPrimitiveIndex()][0]);
+  const float3 diffuse = make_float3(material.diffuseFactor.x, material.diffuseFactor.y, material.diffuseFactor.z);
+  const float metallic = material.metallicFactor;
+  const float roughness = material.roughnessFactor;
+  const float3 wo = normalize(-ray_d);
+  const float3 n = dot(wo, normal) < 0.0f ? -normal : normal;
+  const float nDotV = fmaxf(dot(n, wo), 1e-4f);
+  const float3 f0 = make_float3(0.04f) * (1.0f - metallic) + diffuse * metallic;
+  const float rx = 1.0f - roughness, ry = 0.0425f - 0.0275f * roughness, rz = 1.04f - 0.572f * roughness, rw = 0.022f * roughness - 0.04f;
+  const float a004 = fminf(rx * rx, exp2f(-9.28f * nDotV)) * rx + ry;
+  payload->bsdfValue = f0 * (rz - 1.04f * a004) + make_float3(rw + 1.04f * a004);
+  payload->nextEmissive = material.emissiveFactor;
+  payload->coneSpreadAdd = params.coneParams.y * roughness * roughness;
+  payload->pbrNumBounces = payload->pbrNumBounces + 1;
+  new_ray_dir = 2.0f * dot(n, wo) * n - wo;
+}
+
 #endif
