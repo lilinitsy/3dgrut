@@ -46,144 +46,167 @@ extern "C" __global__ void __raygen__rg() {
   const int rx = fminf(idx.x, params.frameBounds.x);
   const int ry = fminf(idx.y, params.frameBounds.y);
 
-  // Initialize Payload
-  HybridRayPayload payload;
-  payload.t_hit = 0.0;
-  payload.rayOri = make_float3(rayOrigin.x, rayOrigin.y, rayOrigin.z);
-  payload.rayDir = make_float3(rayDirection.x, rayDirection.y, rayDirection.z);
-  payload.numBounces = 0;
-  if (params.useRayIds) {
-    const uint2 ids = getRayIds();
-    payload.rndSeed = tea<16>(ids.x, ids.y);
-  } else {
-    payload.rndSeed = tea<16>(dim.x * idx.y + idx.x, params.frameNumber);
+  // Samples for this pixel: one, unless a per-pixel mode asks for n Monte Carlo samples (sample i uses the random
+  // numbers of frame frameNumber + i) or for none
+  int numSamples = 1;
+  if (params.pixelMode)
+  {
+    const float mode = pixelModeValue();
+    numSamples = mode > 0.0f ? (int)mode : (mode < 0.0f ? 1 : 0);
   }
-  const float ray_t_max = params.rayMaxT[idx.z][ry][rx];
-  // Initialize Payload PBR fields
-  payload.accumulatedColor = make_float3(0.0);
-  payload.accumulatedAlpha = 0.0;
-  payload.directLight = make_float3(0.0);
-  payload.pathThroughput = make_float3(1.0);
-  payload.bsdfValue = make_float3(1.0);
-  payload.pbrNumBounces = 0;
-  payload.rayMissed = false;
-  // Initialize AOVs to their "no hit" sentinels
+  HybridRayPayload payload;
+  RayData rayData;
+  float aovGaussDepth = 0.0f;
+  float aovFirstHitTransmittance = 0.0f;
+  float3 lastRayOri = rayOrigin; // Last ray origin used to trace Gaussians
+  float3 lastRayDir = rayDirection; // Last ray direction used to trace Gaussians
+  float4 rgbaSum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
   payload.aovHasFirstHit = false;
   payload.aovFirstHitT = -1.0f;
   payload.aovFirstNormal = make_float3(0.0f);
   payload.aovFirstPrimType = 0;
   payload.aovNumRedirections = 0;
-  payload.coneSigma = 0.0f;
-  payload.coneSpread = params.coneParams.x;
-  payload.coneSpreadAdd = 0.0f;
-  float aovGaussDepth = 0.0f;
-  float aovFirstHitTransmittance = 0.0f;
+  for (int sample = 0; sample < numSamples; sample++)
+  {
+    // Initialize Payload
+    payload.t_hit = 0.0;
+    payload.rayOri = make_float3(rayOrigin.x, rayOrigin.y, rayOrigin.z);
+    payload.rayDir = make_float3(rayDirection.x, rayDirection.y, rayDirection.z);
+    payload.numBounces = 0;
+    if (params.useRayIds) {
+      const uint2 ids = getRayIds();
+      payload.rndSeed = tea<16>(ids.x, ids.y + sample);
+    } else {
+      payload.rndSeed = tea<16>(dim.x * idx.y + idx.x, params.frameNumber + sample);
+    }
+    const float ray_t_max = params.rayMaxT[idx.z][ry][rx];
+    // Initialize Payload PBR fields
+    payload.accumulatedColor = make_float3(0.0);
+    payload.accumulatedAlpha = 0.0;
+    payload.directLight = make_float3(0.0);
+    payload.pathThroughput = make_float3(1.0);
+    payload.bsdfValue = make_float3(1.0);
+    payload.pbrNumBounces = 0;
+    payload.rayMissed = false;
+    // Initialize AOVs to their "no hit" sentinels
+    payload.aovHasFirstHit = false;
+    payload.aovFirstHitT = -1.0f;
+    payload.aovFirstNormal = make_float3(0.0f);
+    payload.aovFirstPrimType = 0;
+    payload.aovNumRedirections = 0;
+    payload.coneSigma = 0.0f;
+    payload.coneSpread = params.cone.pixelSpread;
+    payload.coneSpreadAdd = 0.0f;
+    payload.sampleIndex = sample;
+    aovGaussDepth = 0.0f;
+    aovFirstHitTransmittance = 0.0f;
 
-  // Initialize 3drt output buffers, we'll soon aggregate in them
-  RayData rayData;
-  rayData.initialize();
-  payload.rayData = &rayData;
+    // Initialize 3drt output buffers, we'll soon aggregate in them
+    rayData.initialize();
+    payload.rayData = &rayData;
 
-  float3 lastRayOri; // Last ray origin used to trace Gaussians
-  float3 lastRayDir; // Last ray direction used to trace Gaussians
-  unsigned int timeout = 0;
+    unsigned int timeout = 0;
 
-  // Loop always runs at least once.
-  // Termination criteria:
-  // 1. Ray missed surface (ray dir is 0), or
-  // 2. PBR Materials: No remaining bounces, or
-  // 3. PBR Materials: pathThroughput is zero -> no more color is reflected
-  // back, or
-  // 4. Mirrors: No remaining bounces
-  while (!payload.rayMissed && (length(payload.pathThroughput) > 0.0001) &&
-         payload.accumulatedAlpha < 0.995 &&
-         (payload.pbrNumBounces < params.maxPBRBounces) &&
-         (payload.numBounces < MAX_BOUNCES) &&
-         (getNextTraceState() != PGRNDTraceTerminate)) {
-    // Fetch ray orig + dir to use for next mesh + Gaussian passes.
-    const float3 rayOri = payload.rayOri;
-    const float3 rayDir = payload.rayDir;
+    // Loop always runs at least once.
+    // Termination criteria:
+    // 1. Ray missed surface (ray dir is 0), or
+    // 2. PBR Materials: No remaining bounces, or
+    // 3. PBR Materials: pathThroughput is zero -> no more color is reflected
+    // back, or
+    // 4. Mirrors: No remaining bounces
+    while (!payload.rayMissed && (length(payload.pathThroughput) > 0.0001) &&
+           payload.accumulatedAlpha < 0.995 &&
+           (payload.pbrNumBounces < params.maxPBRBounces) &&
+           (payload.numBounces < MAX_BOUNCES) &&
+           (getNextTraceState() != PGRNDTraceTerminate)) {
+      // Fetch ray orig + dir to use for next mesh + Gaussian passes.
+      const float3 rayOri = payload.rayOri;
+      const float3 rayDir = payload.rayDir;
 
-    // First trace the closest hit point with a mesh, and compute new ray
-    // direction + how much light scattered
-    payload.bsdfValue = make_float3(
-        1.0f); // Will contain how much light is scattered along this path
-    payload.nextEmissive =
-        make_float3(0.0f); // Will contain how much additional light is emitted
-                           // along this path
-    // Trace the ray against BVH of reflective / refractive faces
-    traceMesh(rayOri, rayDir, &payload);
+      // First trace the closest hit point with a mesh, and compute new ray
+      // direction + how much light scattered
+      payload.bsdfValue = make_float3(
+          1.0f); // Will contain how much light is scattered along this path
+      payload.nextEmissive =
+          make_float3(0.0f); // Will contain how much additional light is emitted
+                             // along this path
+      // Trace the ray against BVH of reflective / refractive faces
+      traceMesh(rayOri, rayDir, &payload);
 
-    // snapshot of densities before traceGaussians
-    const float preSegDensity = rayData.density;
-    const float preSegHitDistance = rayData.hitDistance;
+      // snapshot of densities before traceGaussians
+      const float preSegDensity = rayData.density;
+      const float preSegHitDistance = rayData.hitDistance;
 
-    // Then perform volumetric radiance integration from ray origin to closest
-    // hit point (or infinity is ray missed)
-    float next_ray_t = payload.rayMissed ? ray_t_max : payload.t_hit;
-    float4 volumetricRadDns =
-        traceGaussians(rayData, rayOri, rayDir, 1e-9, next_ray_t, &payload);
-    float3 radiance =
-        make_float3(volumetricRadDns.x, volumetricRadDns.y, volumetricRadDns.z);
-    float density = volumetricRadDns.w;
-    if (timeout == 0)
-    {
-      const bool diffuseFirst = payload.aovHasFirstHit && payload.aovFirstPrimType == PGRNDPrimitiveDiffuse;
-      const float segDensity = diffuseFirst ? preSegDensity : rayData.density;
-      const float segHitDistance = diffuseFirst ? preSegHitDistance : rayData.hitDistance;
-      aovGaussDepth = (segDensity > 0.0f) ? (segHitDistance / segDensity) : 0.0f;
-      aovFirstHitTransmittance = payload.aovHasFirstHit ? (1.0f - segDensity) : 0.0f;
+      // Then perform volumetric radiance integration from ray origin to closest
+      // hit point (or infinity is ray missed)
+      float next_ray_t = payload.rayMissed ? ray_t_max : payload.t_hit;
+      float4 volumetricRadDns =
+          traceGaussians(rayData, rayOri, rayDir, 1e-9, next_ray_t, &payload);
+      float3 radiance =
+          make_float3(volumetricRadDns.x, volumetricRadDns.y, volumetricRadDns.z);
+      float density = volumetricRadDns.w;
+      if (timeout == 0)
+      {
+        const bool diffuseFirst = payload.aovHasFirstHit && payload.aovFirstPrimType == PGRNDPrimitiveDiffuse;
+        const float segDensity = diffuseFirst ? preSegDensity : rayData.density;
+        const float segHitDistance = diffuseFirst ? preSegHitDistance : rayData.hitDistance;
+        aovGaussDepth = (segDensity > 0.0f) ? (segHitDistance / segDensity) : 0.0f;
+        aovFirstHitTransmittance = payload.aovHasFirstHit ? (1.0f - segDensity) : 0.0f;
+      }
+
+      // Move the cone to the next segment's origin, then widen it by the lobe of the surface hit there
+      payload.coneSigma += payload.coneSpread * payload.t_hit;
+      payload.coneSpread += payload.coneSpreadAdd;
+      payload.coneSpreadAdd = 0.0f;
+
+      // -- Now accumulate the radiance collected along this path:
+      // TODO (operel): The following will not suffice for pbr primitives with
+      // transmittance, maybe bookkeep directLight and pathThroughput at mesh
+      // intersection points and backtrack?
+
+      // Aggregate volumetric radiance
+      payload.accumulatedAlpha += density * (1.0f - payload.accumulatedAlpha);
+      payload.accumulatedColor +=
+          payload.pathThroughput *
+          radiance; // Contribution of Gaussian radiance to path
+
+      // Update attenuation of light according to volumetric integration:
+      // This is by how much the Gaussians affect shading of PBR materials
+      payload.directLight += radiance; // Gaussians also act as light sources
+      payload.pathThroughput *=
+          (1.0f - density); // Modulate throughput by volumetric transmittance
+
+      // Update attenuation of light according to BRDF + BTDF
+      // This is how much light was emitted by the surface + scattered along this
+      // path, modulated by the throughput
+      payload.accumulatedColor +=
+          payload.pathThroughput * (payload.directLight + payload.nextEmissive);
+      payload.pathThroughput *= payload.bsdfValue;
+
+      // Keep this in case additional background sampling is done external to the
+      // shader
+      lastRayOri = rayOri;
+      lastRayDir = rayDir;
+
+      timeout += 1;
+      if (timeout > TIMEOUT_ITERATIONS)
+        break;
     }
 
-    // Move the cone to the next segment's origin, then widen it by the lobe of the surface hit there
-    payload.coneSigma += payload.coneSpread * payload.t_hit;
-    payload.coneSpread += payload.coneSpreadAdd;
-    payload.coneSpreadAdd = 0.0f;
+    const float3 background = getBackgroundColor(lastRayDir);
+    payload.directLight += background;
+    payload.pathThroughput *= (1.0f - payload.accumulatedAlpha);
+    payload.accumulatedColor += payload.pathThroughput * payload.directLight;
+    payload.accumulatedAlpha = clamp(payload.accumulatedAlpha, 0.0f, 1.0f);
 
-    // -- Now accumulate the radiance collected along this path:
-    // TODO (operel): The following will not suffice for pbr primitives with
-    // transmittance, maybe bookkeep directLight and pathThroughput at mesh
-    // intersection points and backtrack?
-
-    // Aggregate volumetric radiance
-    payload.accumulatedAlpha += density * (1.0f - payload.accumulatedAlpha);
-    payload.accumulatedColor +=
-        payload.pathThroughput *
-        radiance; // Contribution of Gaussian radiance to path
-
-    // Update attenuation of light according to volumetric integration:
-    // This is by how much the Gaussians affect shading of PBR materials
-    payload.directLight += radiance; // Gaussians also act as light sources
-    payload.pathThroughput *=
-        (1.0f - density); // Modulate throughput by volumetric transmittance
-
-    // Update attenuation of light according to BRDF + BTDF
-    // This is how much light was emitted by the surface + scattered along this
-    // path, modulated by the throughput
-    payload.accumulatedColor +=
-        payload.pathThroughput * (payload.directLight + payload.nextEmissive);
-    payload.pathThroughput *= payload.bsdfValue;
-
-    // Keep this in case additional background sampling is done external to the
-    // shader
-    lastRayOri = rayOri;
-    lastRayDir = rayDir;
-
-    timeout += 1;
-    if (timeout > TIMEOUT_ITERATIONS)
-      break;
+    // Add this sample; the mean is written back below
+    rgbaSum.x += payload.accumulatedColor.x;
+    rgbaSum.y += payload.accumulatedColor.y;
+    rgbaSum.z += payload.accumulatedColor.z;
+    rgbaSum.w += payload.accumulatedAlpha;
   }
-
-  const float3 background = getBackgroundColor(lastRayDir);
-  payload.directLight += background;
-  payload.pathThroughput *= (1.0f - payload.accumulatedAlpha);
-  payload.accumulatedColor += payload.pathThroughput * payload.directLight;
-  payload.accumulatedAlpha = clamp(payload.accumulatedAlpha, 0.0f, 1.0f);
-
-  // Write back to global mem in launch params
-  const float4 rgba =
-      make_float4(payload.accumulatedColor.x, payload.accumulatedColor.y,
-                  payload.accumulatedColor.z, payload.accumulatedAlpha);
+  const float invSamples = numSamples > 0 ? 1.0f / (float)numSamples : 0.0f;
+  const float4 rgba = make_float4(rgbaSum.x * invSamples, rgbaSum.y * invSamples, rgbaSum.z * invSamples, rgbaSum.w * invSamples);
 
   writeRadianceDensityToOutputBuffer(rgba);
   writeUpdatedRaysToBuffer(lastRayOri, lastRayDir);
@@ -259,9 +282,9 @@ static __device__ __inline__ void
 handlePBR(const float3 ray_o, const float3 ray_d, float3 normal,
           unsigned int &numBounces, float &hit_t, float3 &new_ray_dir,
           unsigned int &rndSeed, HybridRayPayload *payload) {
-  if (params.playgroundOpts & PGRNDRenderConeTracing)
+  if (coneActive())
   {
-    cone_cook_torrance_brdf(ray_d, normal, new_ray_dir, payload);
+    cone_cook_torrance_brdf(ray_d, normal, new_ray_dir, rndSeed, payload);
   }
   else
   {

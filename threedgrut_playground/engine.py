@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import time
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -32,7 +33,10 @@ from kaolin.render.camera import (
 )
 
 from threedgrut.model.model import MixtureOfGaussians
-from threedgrut_playground.tracer import Tracer
+from threedgrut_playground.lod.build import GaussianLOD, build_lod
+from threedgrut_playground.lod.cache import DEFAULT_CACHE_DIR, cache_path, lod_cache_key, load_or_build
+from threedgrut_playground.lod.slots import lod_slot_inflations, plan_lod_slots
+from threedgrut_playground.tracer import Tracer, make_cone_params
 from threedgrut_playground.utils.depth_of_field import DepthOfField
 from threedgrut_playground.utils.environment import Environment
 from threedgrut_playground.utils.kaolin_future.fisheye import generate_fisheye_rays
@@ -49,6 +53,9 @@ from threedgrut_playground.utils.video_out import VideoRecorder
 #################################
 ##       --- Common ---        ##
 #################################
+
+# MixtureOfGaussians fields the Gaussian LOD is built from
+_LOD_SOURCE_FIELDS = ("positions", "rotation", "scale", "density", "features_albedo", "features_specular")
 
 
 @dataclass
@@ -812,6 +819,10 @@ class Engine3DGRUT:
     def __init__(
         self, gs_object: str, mesh_assets_folder: str, default_config: str, envmap_assets_folder: Optional[str] = None
     ):
+        # The LOD cache is keyed by the file as it was when loaded, so a checkpoint rewritten later is not mistaken
+        # for the Gaussians already in memory
+        self._gs_object_path = gs_object
+        self._gs_object_mtime_ns = os.stat(gs_object).st_mtime_ns
         self.scene_mog, self.scene_name = self.load_3dgrt_object(gs_object, config_name=default_config)
         self.tracer = Tracer(self.scene_mog.conf)
         self.device = self.scene_mog.device
@@ -845,21 +856,68 @@ class Engine3DGRUT:
         self.disable_gaussian_tracing = False
 
         scene_scale = self.scene_mog.positions.max(dim=0)[0] - self.scene_mog.positions.min(dim=0)[0]
-        
+
         # Cone tracing test: PBR reflections trace one cone along the mirror direction, widening the Gaussians
         self.use_cone_tracing = False
-        
+
         # Cone spread added per unit GGX alpha (sqrt(2): the reflected lobe is about twice the half-vector lobe)
         self.cone_roughness_scale = 1.414
-        
-        # Largest cone std in world units; the Gaussian proxies are inflated by it while cone tracing is on. Cost grows steeply: on the 30k-step room, 0.005 is about 2x one MC sample per frame and 0.02 about 20x
+
+        # Largest cone std in world units. LOD off: the main BVH's Gaussian proxies are inflated by it while cone
+        # tracing is on, and cost grows steeply: on the 30k-step room, 0.005 costs about 1.4x one MC sample per frame
+        # (512 px) and 0.02 about 20x. LOD on: the main BVH stays uninflated, the cap is clamped to the top band
+        # (s_{K+1}), and only the top enabled LOD slot is inflated by it (lower slots by their band's upper edge)
         self.cone_max_sigma = 0.005
         self._gs_bvh_inflate = 0.0
-        self.primitives = Primitives(tracer=self.tracer, mesh_assets_folder=mesh_assets_folder, scene_scale=scene_scale, device=self.device)
+
+        # Cones apply to PBR hits at or below this roughness; rougher hits fall back to MC sampling
+        self.cone_max_roughness = 0.2
+
+        # Cone tracing is used for pixels right of this fraction of the width, the rest render without cones
+        self.cone_split = 0.0
+
+        # Camera rays carry the pixel footprint as a cone (True), or trace as thin rays like MC (False). False keeps
+        # cone pixels without glossy hits at MC cost and image; reflections then start from a point at the hit.
+        self.cone_camera_rays = True
+
+        # Per-pixel render mode for one launch (``Tracer.render_playground``'s ``pixel_mode``): None, or a float32
+        # [H,W] / [B,H,W] CUDA tensor with n > 0 for n MC samples, -c < 0 for a cone capped at c, 0 for nothing.
+        # Overrides cone_split; cones still need use_cone_tracing. Replace the tensor (or write into it) to change it.
+        self.pixel_mode = None
+        self._pixel_mode_cap_cache = None
+
+        # Gaussian LOD for cones: a merge tree of the Gaussians with one cut per width band [s_k, s_{k+1}), s_k =
+        # lod_base_sigma * 2^(k-1), so a cone reads Gaussians about as wide as itself. Built (or loaded from
+        # lod_cache_dir) on first use. With LOD on, the main BVH stays uninflated and each band has its own structure
+        self.use_gaussian_lod = False
+        self.lod_base_sigma = 0.005  # s_1
+        self.lod_num_levels = 7  # K merged levels, bands up to s_{K+1} = 0.64
+        # Cone widths below this (s_0) trace the uninflated main BVH without widening. 0.002: the largest tested value
+        # that leaves the room ladder frame negligibly changed (FLIP 0.0002 vs per-Gaussian at cap 0.005; Task 4)
+        self.lod_thin_sigma = 0.002
+        # Widen each Gaussian by the cone (True), or only pick the LOD level for the cone's width and trace it with a
+        # thin ray (False): slots are then built uninflated and the kernel's widening clamp (slot inflation) is 0
+        self.lod_widen = True
+        self.lod_cache_dir = DEFAULT_CACHE_DIR
+        self._lod: Optional[GaussianLOD] = None
+        self._lod_build_params = None  # (base_sigma, num_levels) of self._lod
+        self._lod_source_state = None  # _gaussian_source_state() when self._lod was built
+        self._lod_slots = None  # (lod, num_slots, inflations) of the slots 1..num_slots-1 built on the tracer
+        self._lod_cap_warned = False
+
+        # Clamp each rendered frame to [0, 1] before it is accumulated. Off only for unbiased offline averaging: Monte Carlo
+        # samples above 1 lose energy when clamped one frame at a time, so the clamped mean is darker than the true mean
+        self.clamp_frame_output = True
+        self.primitives = Primitives(
+            tracer=self.tracer, mesh_assets_folder=mesh_assets_folder, scene_scale=scene_scale, device=self.device
+        )
         self.primitives.add_primitive(
             geometry_type="Sphere", primitive_type=OptixPrimitiveTypes.GLASS, device=self.device
         )
         self.rebuild_bvh(self.scene_mog)
+        # The Gaussians as loaded, to tell whether the on-disk LOD cache still applies (densities: 4 bytes each)
+        self._gs_loaded_state = self._gaussian_source_state()
+        self._gs_loaded_density = self.scene_mog.density.detach().clone()
 
         self.last_state = dict(camera=None, rgb=None, opacity=None)
 
@@ -956,14 +1014,40 @@ class Engine3DGRUT:
             playground_render_opts |= OptixPlaygroundRenderOptions.DISABLE_PBR_TEXTURES
         if self.use_cone_tracing:
             playground_render_opts |= OptixPlaygroundRenderOptions.CONE_TRACING
-        bvh_inflate = self.cone_max_sigma if self.use_cone_tracing else 0.0
+        split_column = int(round(self.cone_split * rays_o.shape[2]))
+        # Inflate the BVH only when the frame has cone pixels (split_column < W). Any split with cone pixels shares the
+        # inflated BVH between both halves, so the MC half is like-for-like; a frame with none (cone_split = 1.0) keeps
+        # the plain BVH, since inflation alone changes cone-off output (3DGRT sorts hits by proxy entry distance).
+        has_cone_pixels = self.use_cone_tracing and split_column < rays_o.shape[2]
+        frame_max_sigma = self.cone_max_sigma
+        pixel_mode = self.pixel_mode
+        if pixel_mode is not None:
+            # Per-pixel mode: the split column is ignored; the structures are built for the largest cone cap present
+            pixel_mode = pixel_mode[None] if pixel_mode.dim() == 2 else pixel_mode
+            mode_cap, mode_caps = self._pixel_mode_cap(pixel_mode)
+            has_cone_pixels = self.use_cone_tracing and mode_cap > 0.0
+            frame_max_sigma = min(mode_cap, self.cone_max_sigma) if has_cone_pixels else self.cone_max_sigma
+        bvh_inflate = frame_max_sigma if has_cone_pixels else 0.0
+        cone_max_sigma, lod, lod_params = frame_max_sigma, None, None
+        if self.use_gaussian_lod and has_cone_pixels:
+            # LOD: the main BVH (slot 0) stays uninflated and each width band has its own structure, so the MC half
+            # of a split frame traces the plain BVH and equals cone off
+            bvh_inflate = 0.0
+            cone_max_sigma, lod, lod_params = self._prepare_gaussian_lod(
+                frame_max_sigma, mode_caps if pixel_mode is not None else ()
+            )
         if bvh_inflate != self._gs_bvh_inflate:
             self._gs_bvh_inflate = bvh_inflate
             self.tracer.build_gs_acc(gaussians=mog, rebuild=True, inflate=bvh_inflate)
-        
-        # Camera rays start as a point with the std of a box pixel, width / sqrt(12)
+
+        # Camera rays start as a point with the std of a box pixel, width / sqrt(12). With cone_camera_rays off they
+        # start with zero width: the camera segment traces like MC, and reflections start from a point at the hit.
         pixel_spread = math.radians(self.camera_fov) / rays_o.shape[1] / math.sqrt(12.0)
-        cone_params = torch.tensor([pixel_spread, self.cone_roughness_scale, self.cone_max_sigma], dtype=torch.float32)
+        if not self.cone_camera_rays:
+            pixel_spread = 0.0
+        cone_params = make_cone_params(
+            pixel_spread, self.cone_roughness_scale, cone_max_sigma, self.cone_max_roughness, split_column
+        )
 
         self.primitives.rebuild_bvh_if_needed()
 
@@ -995,6 +1079,9 @@ class Engine3DGRUT:
             envmap_offset=envmap_offset,
             max_pbr_bounces=self.max_pbr_bounces,
             cone_params=cone_params,
+            lod=lod,
+            lod_params=lod_params,
+            pixel_mode=pixel_mode,
         )
 
         pred_features = rendered_results["pred_features"]
@@ -1013,7 +1100,10 @@ class Engine3DGRUT:
         # Advance frame id (for i.e., random number generator) and avoid int32 overflow
         self.frame_id = self.frame_id + self.spp.batch_size if self.frame_id <= (2**31 - 1) else 0
 
-        pred_features = torch.clamp(pred_features, 0.0, 1.0)  # Make sure image pixels are in valid range
+        if self.clamp_frame_output:
+            pred_features = torch.clamp(pred_features, 0.0, 1.0)  # Make sure image pixels are in valid range
+        if self.use_cone_tracing and 0.0 < self.cone_split < 1.0 and 0 <= split_column < pred_features.shape[2]:
+            pred_features[:, :, split_column, :] = 1.0  # White line between the MC (left) and cone (right) halves
 
         rendered_results["pred_features"] = pred_features
         return rendered_results
@@ -1248,6 +1338,177 @@ class Engine3DGRUT:
         rebuild = True
         self.tracer.build_gs_acc(gaussians=scene_mog, rebuild=rebuild, inflate=self._gs_bvh_inflate)
         self.primitives.rebuild_bvh_if_needed()
+
+    def _gaussian_source_state(self) -> tuple:
+        """The tensors the LOD is built from, with their in-place version counters: O(1), so it can run per frame.
+        Replacing a field (as slicing planes do) or writing into it changes the state."""
+        fields = (getattr(self.scene_mog, name, None) for name in _LOD_SOURCE_FIELDS)
+        return tuple((t, t._version) if isinstance(t, torch.Tensor) else (None, -1) for t in fields)
+
+    @staticmethod
+    def _same_source_state(a: tuple, b: tuple) -> bool:
+        return len(a) == len(b) and all(x[0] is y[0] and x[1] == y[1] for x, y in zip(a, b))
+
+    def _scene_matches_checkpoint(self) -> bool:
+        """Whether the Gaussians still hold the values loaded from the checkpoint, so the on-disk LOD cache applies.
+
+        Densities (which slicing planes edit) are compared by value, so undoing a slice makes the cache usable again;
+        the other fields must be the loaded tensors, never written since. Runs once per LOD build, not per frame.
+        """
+        current = self._gaussian_source_state()
+        for name, (t, version), (t0, version0) in zip(_LOD_SOURCE_FIELDS, current, self._gs_loaded_state):
+            if name == "density":
+                if t is None or t.shape != self._gs_loaded_density.shape:
+                    return False
+                if not torch.equal(t.detach(), self._gs_loaded_density):
+                    return False
+            elif t is not t0 or version != version0:
+                return False
+        return True
+
+    def invalidate_gaussian_lod(self) -> None:
+        """Call after editing the Gaussians in memory (e.g. slicing planes): the next LOD frame rebuilds the hierarchy
+        from the current values, without the on-disk cache while the scene differs from the checkpoint."""
+        if self._lod is not None or self._lod_slots is not None:
+            self.release_gaussian_lod()
+
+    def ensure_gaussian_lod(self) -> GaussianLOD:
+        """The Gaussian LOD of the scene for ``lod_base_sigma`` and ``lod_num_levels``: kept in memory, else loaded
+        from ``lod_cache_dir``, else built and saved there. Prints the build or load time.
+
+        An in-memory LOD is rebuilt when the Gaussians it was built from are replaced or written. A scene edited since
+        the checkpoint was loaded (e.g. by slicing planes) is built uncached: never saved to, nor loaded from, disk.
+        """
+        mog = self.scene_mog
+        params = (float(self.lod_base_sigma), int(self.lod_num_levels))
+        state = self._gaussian_source_state()
+        if (
+            self._lod is not None
+            and self._lod_build_params == params
+            and self._same_source_state(self._lod_source_state, state)
+        ):
+            return self._lod
+        self.release_gaussian_lod()
+        key = lod_cache_key(
+            self._gs_object_path, mog.num_gaussians, params[0], params[1], mtime_ns=self._gs_object_mtime_ns
+        )
+        built = []
+
+        def build():
+            built.append(True)
+            with torch.no_grad():
+                features = mog.get_features()
+                if mog.progressive_training:
+                    features = features * mog.get_active_feature_mask()
+                return build_lod(
+                    mog.positions.detach().contiguous(),
+                    mog.get_rotation().detach().contiguous(),
+                    mog.get_scale().detach().contiguous(),
+                    mog.get_density().detach().contiguous(),
+                    features.detach().contiguous(),
+                    base_sigma=params[0],
+                    num_levels=params[1],
+                    key=key,
+                )
+
+        start = time.perf_counter()
+        if self._scene_matches_checkpoint():
+            lod = load_or_build(key, build, cache_dir=self.lod_cache_dir, device=self.device)
+            verb = "built and saved" if built else "loaded"
+            where = f"cache {cache_path(key, self.lod_cache_dir)}"
+        else:
+            lod = build()
+            verb = "built"
+            where = "not cached: the Gaussians were edited after loading (e.g. slicing planes)"
+        lod.particle_density()  # built once here rather than on the first frame
+        torch.cuda.synchronize()
+        print(
+            f"Gaussian LOD {verb} in {time.perf_counter() - start:.2f} s: {lod.positions.shape[0]} particles, "
+            f"{len(lod.slot_index)} levels, {where}",
+            flush=True,
+        )
+        self._lod, self._lod_build_params, self._lod_source_state = lod, params, state
+        return lod
+
+    @property
+    def gaussian_lod_resident(self) -> bool:
+        """Whether a LOD hierarchy or its slot structures are held in GPU memory. They stay after LOD is turned off,
+        until ``release_gaussian_lod`` (called when the scene changes)."""
+        return self._lod is not None or self._lod_slots is not None
+
+    def gaussian_lod_top_sigma(self) -> float:
+        """The largest cone cap a LOD frame uses, s_{K+1} for the current ``lod_base_sigma`` and ``lod_num_levels``
+        (or less when the slot limit cuts the layout short): ``cone_max_sigma`` above it is clamped."""
+        level_sigmas = [float(self.lod_base_sigma) * 2**k for k in range(int(self.lod_num_levels) + 1)]
+        return plan_lod_slots(level_sigmas, self.lod_thin_sigma, math.inf)[1]
+
+    def release_gaussian_lod(self) -> None:
+        """Frees the LOD slot structures and drops the in-memory LOD (the cache file stays)."""
+        self.tracer.clear_lod_acc()
+        self._lod_slots = None
+        self._lod = self._lod_build_params = self._lod_source_state = None
+        self._lod_cap_warned = False
+        self.tracer._lod_node_index_cache = None  # the tracer's index table holds a reference to the old LOD
+
+    def _pixel_mode_cap(self, pixel_mode: torch.Tensor) -> Tuple[float, Tuple[float, ...]]:
+        """The largest cone cap in a per-pixel mode tensor (0.0 if it has no cone pixels) and all its distinct caps,
+        cached per tensor and version so an unchanged mode costs no GPU sync per frame."""
+        key = (pixel_mode, pixel_mode._version)
+        cached = self._pixel_mode_cap_cache
+        if cached is not None and cached[0][0] is key[0] and cached[0][1] == key[1]:
+            return cached[1], cached[2]
+        values = torch.unique(pixel_mode[pixel_mode < 0.0])
+        caps = tuple(sorted(-float(v) for v in values.cpu()))
+        cap = caps[-1] if caps else 0.0
+        self._pixel_mode_cap_cache = (key, cap, caps)
+        return cap, caps
+
+    def _prepare_gaussian_lod(
+        self, max_sigma: Optional[float] = None, pixel_caps: Tuple[float, ...] = ()
+    ) -> Tuple[float, GaussianLOD, torch.Tensor]:
+        """For a LOD frame with cone pixels: the cone cap clamped to the top band, the LOD and its parameter block.
+
+        Builds the slots whose band starts below the clamped cap. Each is inflated by its band's upper edge, except the
+        top one, which is inflated by the cap (``lod_slot_inflations``). Slots are rebuilt only when the LOD, the slot
+        count or the cap changes, and then only the slots whose inflation changed (``Tracer.build_lod_acc``): a cap
+        change within a band rebuilds the top slot, a wider cap builds the added ones.
+        """
+        lod = self.ensure_gaussian_lod()
+        max_sigma = self.cone_max_sigma if max_sigma is None else max_sigma
+        num_slots, cap = plan_lod_slots(lod.level_sigmas, self.lod_thin_sigma, max_sigma)
+        if cap < max_sigma:
+            if not self._lod_cap_warned:
+                print(
+                    f"Gaussian LOD: cone max std {max_sigma:g} is above the top band; clamped to {cap:g}",
+                    flush=True,
+                )
+                self._lod_cap_warned = True
+        else:
+            self._lod_cap_warned = False
+        inflations = lod_slot_inflations(lod.level_sigmas, num_slots, cap)
+        if not self.lod_widen:  # level selection only: uninflated slots, so the kernel never widens
+            inflations = [0.0] * len(inflations)
+        # Per-pixel mode: every cap below the frame's gets the slot whose band holds it, inflated by exactly that cap
+        variants = []
+        for c in pixel_caps:
+            c_slots, c_cap = plan_lod_slots(lod.level_sigmas, self.lod_thin_sigma, min(c, cap))
+            band = c_slots - 1
+            if band >= 1 and c_cap < cap and c_cap != inflations[band - 1]:
+                variants.append((c_cap, band))
+        variants = tuple(variants) if self.lod_widen else ()
+        if (
+            self._lod_slots is None
+            or self._lod_slots[0] is not lod
+            or self._lod_slots[1:] != (num_slots, inflations, variants)
+        ):
+            self._lod_slots = None
+            if num_slots > 1:
+                self.tracer.build_lod_acc(lod, inflations)
+            if variants:
+                self.tracer.build_lod_cap_variants(lod, variants)
+            self._lod_slots = (lod, num_slots, inflations, variants)
+        lod_params = self.tracer.make_lod_params(lod, self.lod_thin_sigma, num_slots=num_slots, cap_variants=variants)
+        return cap, lod, lod_params
 
     def did_camera_change(self, camera: Camera) -> bool:
         """Checks if the camera view matrix has changed from the last cached state.

@@ -14,8 +14,10 @@
 # limitations under the License.
 
 import logging
+import math
 import os
-from typing import Optional
+import struct
+from typing import List, Optional
 
 import torch
 import torch.utils.cpp_extension
@@ -77,6 +79,29 @@ def _validate_ray_ids(
     return True
 
 
+def make_cone_params(
+    pixel_spread: float, spread_per_alpha: float, max_sigma: float, max_roughness: float, split_column: int
+) -> torch.Tensor:
+    """CPU float32 ``[5]`` tensor read by ``traceHybrid``: camera ray spread, spread per unit GGX alpha, max cone std,
+    max roughness, and the first pixel column that uses cones."""
+    values = [pixel_spread, spread_per_alpha, max_sigma, max_roughness, float(split_column)]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+MAX_LOD_SLOTS = 10  # MaxLodSlots in pipelineParameters.h
+MAX_LOD_CAP_VARIANTS = 8  # MaxLodCapVariants in pipelineParameters.h
+_MAX_EXACT_FLOAT32_INT = 2**24  # lodParams carries the index table offsets as float32
+
+
+def _as_float32(x: float) -> float:
+    """``x`` rounded to float32, as the C++ slots store their inflation."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def _disabled_lod_params() -> torch.Tensor:
+    return torch.zeros(2, dtype=torch.float32)
+
+
 class Tracer:
     def __init__(self, conf):
         self.device = "cuda"
@@ -130,6 +155,159 @@ class Tracer:
                 allow_bvh_update,
             )
             self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
+
+    def build_lod_acc(self, lod, inflations) -> List[int]:
+        """Builds the LOD slot acceleration structures 1..len(inflations) of ``lod`` (a ``GaussianLOD``), a prefix of
+        the slot layout. Slot 1 holds the originals inflated by ``inflations[0]``; slot 1 + k holds cut k inflated by
+        ``inflations[k]``. The kernel widens a slot's Gaussians by at most its inflation. Slot 0 is the main BVH of
+        ``build_gs_acc``, which is not touched.
+
+        Incremental: a slot already built from the same ``lod`` with the same inflation is kept, so a cap change within
+        a band rebuilds only the top slot and a wider cap builds only the added slots. Slots above the prefix are kept
+        too (the kernel reads only the enabled ones) and are reused if they come back with the same inflation. Another
+        ``lod`` frees every slot first. Returns the slots that were built. Runs when the LOD or the cap changes, never
+        per frame."""
+        num_levels = len(lod.slot_index)
+        if not 1 <= len(inflations) <= num_levels + 1 or 1 + len(inflations) > MAX_LOD_SLOTS:
+            raise ValueError(
+                f"inflations must hold 1..{min(num_levels + 1, MAX_LOD_SLOTS - 1)} values, got {len(inflations)}"
+            )
+        inflations = [float(x) for x in inflations]
+        if not all(math.isfinite(x) and x >= 0.0 for x in inflations):
+            raise ValueError(f"inflations must be finite and >= 0, got {inflations}")
+        if getattr(self, "_lod_acc_owner", None) is not lod:
+            self.tracer_wrapper.clear_lod_bvh()
+            self._lod_acc_owner = None
+            self._lod_variant_keys = {}
+        # What the C++ slots hold (-1: not built, or stale), so a clear_lod_bvh from elsewhere forces a rebuild
+        built = self.tracer_wrapper.lod_slot_inflations()
+        num_particles = lod.positions.shape[0]
+        rebuilt = []
+        with torch.cuda.nvtx.range("build-lod-bvh"):
+            for j, inflate in enumerate(inflations):
+                slot = 1 + j
+                if built[slot] >= 0.0 and built[slot] == _as_float32(inflate):
+                    continue
+                if j == 0:
+                    rows = slice(0, lod.num_original)
+                else:
+                    rows = lod.slot_index[j - 1].to(device=lod.positions.device, dtype=torch.long)
+                    if rows.numel() > 0 and (int(rows.min()) < 0 or int(rows.max()) >= num_particles):
+                        raise ValueError(f"slot_index[{j - 1}] holds indices outside [0, {num_particles})")
+                scale = lod.scales[rows]
+                if inflate > 0.0:
+                    scale = torch.sqrt(scale * scale + inflate * inflate)
+                self._lod_acc_owner = lod
+                self.tracer_wrapper.build_lod_bvh(
+                    slot,
+                    lod.positions[rows].contiguous(),
+                    lod.rotations[rows].contiguous(),
+                    scale.contiguous(),
+                    lod.densities[rows].contiguous(),
+                    inflate,
+                )
+                rebuilt.append(slot)
+        self._lod_acc_owner = lod
+        return rebuilt
+
+    def build_lod_cap_variants(self, lod, variants) -> List[int]:
+        """Builds the cap variants of ``lod`` for a per-pixel mode: ``variants`` is a list of ``(cap, band_slot)``, and
+        variant m (physical slot ``MAX_LOD_SLOTS + m``) holds the Gaussians of slot ``band_slot`` (1: the originals,
+        1 + k: cut k) inflated by exactly ``cap``. A pixel capped at ``cap`` then traces it in place of ``band_slot``,
+        which a frame with a larger cap inflates to the band edge. Incremental like ``build_lod_acc``; call it after
+        ``build_lod_acc`` for the same ``lod``. Returns the physical slots that were built."""
+        if len(variants) > MAX_LOD_CAP_VARIANTS:
+            raise ValueError(f"at most {MAX_LOD_CAP_VARIANTS} cap variants, got {len(variants)}")
+        if getattr(self, "_lod_acc_owner", None) is not lod:
+            raise ValueError("build the LOD slots (build_lod_acc) of this lod before its cap variants")
+        built = self.tracer_wrapper.lod_slot_inflations()
+        keys = getattr(self, "_lod_variant_keys", None)
+        if keys is None:
+            keys = self._lod_variant_keys = {}
+        rebuilt = []
+        for m, (cap, band) in enumerate(variants):
+            cap, band = float(cap), int(band)
+            if not (math.isfinite(cap) and cap > 0.0) or not 1 <= band <= len(lod.slot_index) + 1:
+                raise ValueError(f"cap variant {m}: cap {cap} must be > 0 and band slot {band} in [1, K + 1]")
+            physical = MAX_LOD_SLOTS + m
+            key = (cap, band)
+            if built[physical] == _as_float32(cap) and keys.get(physical) == key:
+                continue
+            rows = self._lod_slot_rows(lod, band)
+            scale = torch.sqrt(lod.scales[rows] ** 2 + cap * cap)
+            self.tracer_wrapper.build_lod_bvh(
+                physical,
+                lod.positions[rows].contiguous(),
+                lod.rotations[rows].contiguous(),
+                scale.contiguous(),
+                lod.densities[rows].contiguous(),
+                cap,
+            )
+            keys[physical] = key
+            rebuilt.append(physical)
+        return rebuilt
+
+    @staticmethod
+    def _lod_slot_rows(lod, slot: int):
+        """Rows of ``lod``'s particle buffer that slot ``slot`` holds: the originals for slot 1, cut k for slot 1 + k."""
+        if slot == 1:
+            return slice(0, lod.num_original)
+        rows = lod.slot_index[slot - 2].to(device=lod.positions.device, dtype=torch.long)
+        if rows.numel() > 0 and (int(rows.min()) < 0 or int(rows.max()) >= lod.positions.shape[0]):
+            raise ValueError(f"slot_index[{slot - 2}] holds indices outside [0, {lod.positions.shape[0]})")
+        return rows
+
+    def clear_lod_acc(self) -> None:
+        """Frees every LOD slot structure and forgets which LOD they were built from."""
+        self.tracer_wrapper.clear_lod_bvh()
+        self._lod_acc_owner = None
+        self._lod_variant_keys = {}
+
+    @staticmethod
+    def make_lod_params(
+        lod, thin_sigma: float, num_slots: Optional[int] = None, enabled: bool = True, cap_variants=()
+    ) -> torch.Tensor:
+        """CPU float32 ``[2 + 2S]`` tensor read by ``traceHybrid``: enabled, S, the band lower edges of slots 0..S-1
+        (0, ``thin_sigma`` = s_0, s_1, ..., s_{S-2}) and their offsets into the index table that ``render_playground``
+        builds from ``lod`` (slot 0 unused, slot 1 at 0, slot 1 + k after the originals and cuts 1..k-1). ``num_slots``
+        counts slot 0 and defaults to every slot, 2 + K; slots 1..S-1 must have been built by ``build_lod_acc``.
+        ``cap_variants`` lists the ``(cap, band_slot)`` built by ``build_lod_cap_variants``, in the same order; they
+        are appended as ``[M, cap_0, band_0, ...]``."""
+        num_levels = len(lod.slot_index)
+        if num_slots is None:
+            num_slots = 2 + num_levels
+        if not 1 <= num_slots <= min(2 + num_levels, MAX_LOD_SLOTS):
+            raise ValueError(f"num_slots must be in [1, {min(2 + num_levels, MAX_LOD_SLOTS)}], got {num_slots}")
+        lower = [0.0, float(thin_sigma)] + [float(s) for s in lod.level_sigmas[:num_levels]]
+        offsets = [0, 0]
+        end = lod.num_original
+        for k in range(num_levels):
+            offsets.append(end)
+            end += int(lod.slot_index[k].numel())
+        if end > _MAX_EXACT_FLOAT32_INT:
+            raise ValueError(f"the LOD index table has {end} entries; float32 offsets are exact only up to 2^24")
+        values = (
+            [1.0 if enabled else 0.0, float(num_slots)] + lower[:num_slots] + [float(o) for o in offsets[:num_slots]]
+        )
+        if cap_variants:
+            values += [float(len(cap_variants))]
+            for cap, band in cap_variants:
+                if not 1 <= int(band) < num_slots:
+                    raise ValueError(f"cap variant band slot {band} must be in [1, {num_slots})")
+                values += [float(cap), float(band)]
+        return torch.tensor(values, dtype=torch.float32)
+
+    def _lod_node_index(self, lod) -> torch.Tensor:
+        """The concatenated slot index tables of ``lod``, [arange(N), cut 1, ..., cut K] as CUDA int32, built once per
+        LOD object."""
+        cached = getattr(self, "_lod_node_index_cache", None)
+        if cached is not None and cached[0] is lod:
+            return cached[1]
+        tables = [torch.arange(lod.num_original, dtype=torch.int32, device=self.device)]
+        tables += [t.to(device=self.device, dtype=torch.int32) for t in lod.slot_index]
+        node_index = torch.cat(tables).contiguous()
+        self._lod_node_index_cache = (lod, node_index)
+        return node_index
 
     def build_mesh_acc(self, mesh_vertices, mesh_faces, rebuild=True, allow_update=True):
         with torch.cuda.nvtx.range(f"build-mesh-bvh-full-build-{rebuild}"):
@@ -209,6 +387,41 @@ class Tracer:
         cpbr_material.ior = pbr_mat.ior or 0.0
         return cpbr_material
 
+    _PARTICLE_SOURCE_FIELDS = ("positions", "rotation", "scale", "density", "features_albedo", "features_specular")
+
+    def _particle_buffers(self, gaussians):
+        """``(particle_density, features)`` for the trace, rebuilt only when the Gaussians change.
+
+        Activating and concatenating 1.25M Gaussians costs several ms per frame, so the result is kept while every
+        source tensor is the same object at the same in-place version, and the active SH degree is unchanged.
+        """
+        fields = [getattr(gaussians, name, None) for name in self._PARTICLE_SOURCE_FIELDS]
+        key = tuple((t, t._version) if isinstance(t, torch.Tensor) else (None, -1) for t in fields)
+        key += ((id(gaussians), gaussians.n_active_features, bool(gaussians.progressive_training)),)
+        cached = getattr(self, "_particle_cache", None)
+        if cached is not None and len(cached[0]) == len(key):
+            same = all(a[0] is b[0] and a[1] == b[1] for a, b in zip(cached[0][:-1], key[:-1]))
+            if same and cached[0][-1] == key[-1]:
+                return cached[1], cached[2]
+        with torch.no_grad():
+            features = gaussians.get_features()
+            if gaussians.progressive_training:
+                features = features * gaussians.get_active_feature_mask()
+            mog_dns = gaussians.get_density().contiguous()
+            particle_density = torch.concat(
+                [
+                    gaussians.positions.contiguous(),
+                    mog_dns,
+                    gaussians.get_rotation().contiguous(),
+                    gaussians.get_scale().contiguous(),
+                    torch.zeros_like(mog_dns),
+                ],
+                dim=1,
+            ).contiguous()
+            features = features.contiguous()
+        self._particle_cache = (key, particle_density, features)
+        return particle_density, features
+
     def render_playground(
         self,
         gaussians,
@@ -233,6 +446,9 @@ class Tracer:
         ray_pixel_id: Optional[torch.Tensor] = None,
         ray_sample_index: Optional[torch.Tensor] = None,
         cone_params: Optional[torch.Tensor] = None,
+        lod=None,
+        lod_params: Optional[torch.Tensor] = None,
+        pixel_mode: Optional[torch.Tensor] = None,
     ):
         """Traces the hybrid Gaussian + mesh scene with the playground path tracer.
 
@@ -246,8 +462,20 @@ class Tracer:
         ``(pixel_id, sample_index)`` only, independent of its launch slot, the batch layout and ``frame_id``. When
         omitted, the RNG is keyed by launch index and ``frame_id`` exactly as before.
 
-        ``cone_params`` is a CPU float32 ``[3]`` tensor (camera ray spread, spread per unit GGX alpha, max cone std),
-        used only with the ``CONE_TRACING`` option. Zeros if omitted.
+        ``cone_params`` is a CPU float32 ``[5]`` tensor from ``make_cone_params`` (camera ray spread, spread per unit
+        GGX alpha, max cone std, max roughness, split column), used only with the ``CONE_TRACING`` option. Zeros if
+        omitted.
+
+        ``lod`` is an optional ``GaussianLOD``. When given, the particle buffers are ``lod.particle_density()`` and
+        ``lod.features`` instead of the per-frame concat of ``gaussians`` (the originals keep indices 0..N-1), and its
+        concatenated index table is passed along. ``lod_params`` comes from ``Tracer.make_lod_params``; cone pixels
+        trace the LOD slots when it is enabled. Disabled if omitted; an enabled ``lod_params`` needs ``lod``.
+
+        ``pixel_mode`` is an optional float32 ``[B,H,W]`` CUDA tensor choosing each pixel's render in one launch:
+        ``n > 0`` renders ``n`` Monte Carlo samples averaged in the kernel (sample ``i`` uses the random numbers of
+        frame ``frame_id + i``, so it equals the mean of ``n`` frames), ``-c < 0`` one cone with its std capped at
+        ``min(c, max cone std)`` (needs ``CONE_TRACING``; LOD slots must be built for the largest ``c``), ``0`` nothing.
+        It replaces the split column. Off if omitted.
 
         Besides ``pred_features``, ``pred_opacity``, ``pred_dist``, ``pred_normals``, ``hits_count``, ``last_ray_o``
         and ``last_ray_d``, the returned dict always holds six per-ray AOVs ("first hit" is the first
@@ -287,7 +515,15 @@ class Tracer:
             ray_pixel_id = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
             ray_sample_index = torch.empty([0, 0, 0], dtype=torch.int32, device=ray_o.device)
         if cone_params is None:
-            cone_params = torch.zeros(3, dtype=torch.float32)
+            cone_params = make_cone_params(0.0, 0.0, 0.0, 0.0, 0)
+        if lod_params is None:
+            lod_params = _disabled_lod_params()
+        if lod is None:
+            if lod_params[0].item() != 0.0:
+                raise ValueError("enabled lod_params need the lod they were made for")
+            lod_node_index = torch.empty([0], dtype=torch.int32, device=ray_o.device)
+        else:
+            lod_node_index = self._lod_node_index(lod)
         if ray_max_t is None:
             ray_max_t = ray_o.new_full(size=ray_o.shape[0:3], fill_value=1e9)
         if refractive_index is None:
@@ -311,16 +547,16 @@ class Tracer:
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
             # The feature mask zeros out feature dims the model shouldn't use yet.
             # That introduces a curriculum way of optimizing the model
-            features = gaussians.get_features()
-            if gaussians.progressive_training:
-                features *= gaussians.get_active_feature_mask()
-
-            mog_pos = gaussians.positions.contiguous()
-            mog_dns = gaussians.get_density().contiguous()
-            mog_rot = gaussians.get_rotation().contiguous()
-            mog_scl = gaussians.get_scale().contiguous()
-            particle_density = torch.concat([mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1)
+            if lod is None:
+                particle_density, features = self._particle_buffers(gaussians)
+            else:
+                particle_density = lod.particle_density()
+                features = lod.features.contiguous()
             sph_degree = gaussians.n_active_features
+            if pixel_mode is None:
+                pixel_mode_arg = torch.empty([0], dtype=torch.float32, device=ray_o.device)
+            else:
+                pixel_mode_arg = pixel_mode.to(device=ray_o.device, dtype=torch.float32).contiguous()
             min_transmittance = self.conf.render.min_transmittance
             envmap_offset = envmap_offset.contiguous()
 
@@ -363,6 +599,9 @@ class Tracer:
                 ray_pixel_id,
                 ray_sample_index,
                 cone_params.contiguous(),
+                lod_params.contiguous(),
+                lod_node_index,
+                pixel_mode_arg,
             )
 
             pred_dist = pred_dist[:, :, :, 0:1]  # return only the hit distance

@@ -17,6 +17,7 @@
 #ifdef __PLAYGROUND__MODE__
 
 #include <optix.h>
+#include <playground/kernels/cuda/dfgLut.cuh>
 #include <playground/kernels/cuda/mathUtils.cuh>
 #include <playground/kernels/cuda/rng.cuh>
 #include <playground/kernels/cuda/trace.cuh>
@@ -255,10 +256,10 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
   uint3 rngKey;
   if (params.useRayIds) {
     const uint2 ids = getRayIds();
-    rngKey = make_uint3(ids.x, ids.y, payload->pbrNumBounces);
+    rngKey = make_uint3(ids.x, ids.y + payload->sampleIndex, payload->pbrNumBounces);
   } else {
     rngKey =
-        make_uint3(idx.x, idx.y, getFrameNumber() + payload->pbrNumBounces);
+        make_uint3(idx.x, idx.y, getFrameNumber() + payload->sampleIndex + payload->pbrNumBounces);
   }
   const float3 rand = rnd_pcg3d(rngKey);
   //     const float3 rand = rnd3(rndSeed);   // Enable for an alternative
@@ -267,7 +268,25 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
   const float random_theta_seed = rand.y;
   const float ray_prob = rand.z;
 
-  if ((ray_prob < 0.5f) && ((2.0 * ray_prob) < transmission)) { // Transmissive
+  // Lobe choice in proportion to each lobe's expected weight (the same DFG-based weights as the cone path), each
+  // sample divided by its lobe's probability. Every lobe with a nonzero weight keeps a nonzero probability, so the
+  // estimate stays unbiased; a metal never spends a sample on its zero-weight diffuse lobe.
+  float pTrans, pDiff;
+  {
+    const float3 f0w = lerp(make_float3(0.16f * fresnel_reflect * fresnel_reflect), base_color, metalness);
+    const float2 dfg = dfgLookup(fmaxf(fabsf(dot(normal, wo)), 1e-4f), roughness);
+    const float3 specW = f0w * dfg.x + make_float3(dfg.y);
+    const float3 notSpec = (make_float3(1.0f) - specW) * base_color;
+    const float3 diffW = notSpec * ((1.0f - metalness) * (1.0f - transmission));
+    const float3 transW = notSpec * transmission;
+    const float3 lum = make_float3(0.2126f, 0.7152f, 0.0722f);
+    const float specL = fmaxf(dot(specW, lum), 0.0f), diffL = fmaxf(dot(diffW, lum), 0.0f);
+    const float transL = fmaxf(dot(transW, lum), 0.0f), sumL = specL + diffL + transL;
+    pTrans = sumL > 0.0f ? transL / sumL : 0.0f;
+    pDiff = sumL > 0.0f ? diffL / sumL : 0.0f;
+  }
+
+  if (ray_prob < pTrans) { // Transmissive
     float frontFacing = dot(wo, normal);
     float3 forwardNormal;
     float eta;
@@ -300,8 +319,8 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     float G = geometry_smith(fnormal_dot_wo, fnormal_dot_L, roughness);
     out_factor = base_color * (make_float3(1.0) - F) * G * wo_dot_H /
                  fmaxf((fnormal_dot_H * fnormal_dot_wo), 0.001);
-  } else if ((ray_prob < 0.5f) &&
-             ((2.0 * ray_prob) >= transmission)) { // Diffuse
+    out_factor *= transmission / pTrans;
+  } else if (ray_prob < pTrans + pDiff) { // Diffuse
     // Importance sampling diffuse
     L = importance_sample_diffuse_ggx(normal, random_theta_seed,
                                       random_phi_seed);
@@ -322,7 +341,7 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     // no diffuse for metals
     not_spec *= (1.0 - metalness);
 
-    out_factor = not_spec * base_color;
+    out_factor = not_spec * base_color * ((1.0f - transmission) / pDiff);
   } else {
     // Specular
     // important sample GGX
@@ -346,9 +365,9 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     float G = geometry_smith(normal_dot_wo, normal_dot_L, roughness);
     out_factor =
         F * G * wo_dot_H / fmaxf((normal_dot_H * normal_dot_wo), 0.001);
+    out_factor /= fmaxf(1.0f - pTrans - pDiff, 1e-6f);
   }
 
-  out_factor *= 2.0; // compensate for splitting diffuse and specular
   next_ray_dir = L;
   payload->pbrNumBounces = payload->pbrNumBounces + 1;
   return make_float3(out_factor.x, out_factor.y, out_factor.z);
@@ -448,25 +467,165 @@ static __device__ __inline__ void sampled_cook_torrance_brdf(
 }
 
 
-// One cone along the reflection direction instead of the ray. Weight is the specular lobe average.
-// Only materials are used here, no diffusion/transmission for now.
-static __device__ __noinline__ void cone_cook_torrance_brdf(const float3 ray_d, const float3 normal, float3 &new_ray_dir, HybridRayPayload *payload)
+struct PBRSurface
 {
-  const auto material = get_material(params.matID[optixGetPrimitiveIndex()][0]);
-  const float3 diffuse = make_float3(material.diffuseFactor.x, material.diffuseFactor.y, material.diffuseFactor.z);
-  const float metallic = material.metallicFactor;
-  const float roughness = material.roughnessFactor;
+  float3 diffuse;
+  float3 emissive;
+  float metallic;
+  float roughness;
+  float transmission;
+  float ior;
+  float alpha;
+  unsigned int alphaMode;
+  float alphaCutoff;
+  float3 normal;
+};
+
+// Same fetch as the first half of sampled_cook_torrance_brdf. Used only by the cone path.
+static __device__ __inline__ PBRSurface fetch_pbr_surface(const float3 normal)
+{
+  const unsigned int triId = optixGetPrimitiveIndex();
+  const unsigned int materialId = params.matID[triId][0];
+  const auto material = get_material(materialId);
+
+  const float2 uv0 = make_float2(params.matUV[triId][0][0], params.matUV[triId][0][1]);
+  const float2 uv1 = make_float2(params.matUV[triId][1][0], params.matUV[triId][1][1]);
+  const float2 uv2 = make_float2(params.matUV[triId][2][0], params.matUV[triId][2][1]);
+  const float2 barycentric = optixGetTriangleBarycentrics();
+  const float2 texCoords = (1 - barycentric.x - barycentric.y) * uv0 + barycentric.x * uv1 + barycentric.y * uv2;
+  const bool disablePBRTextures = params.playgroundOpts & PGRNDRenderDisablePBRTextures;
+
+  PBRSurface surface;
+  surface.normal = normal;
+  const float3 diffuseFactor = make_float3(material.diffuseFactor.x, material.diffuseFactor.y, material.diffuseFactor.z);
+  surface.alpha = material.diffuseFactor.w;
+  surface.alphaMode = material.alphaMode;
+  surface.alphaCutoff = material.alphaCutoff;
+  if (!material.useDiffuseTexture || disablePBRTextures)
+  {
+    surface.diffuse = diffuseFactor;
+  }
+  else
+  {
+    const float4 diffuse_fp4 = tex2D<float4>(material.diffuseTexture, texCoords.x, texCoords.y);
+    surface.diffuse = make_float3(diffuse_fp4.x, diffuse_fp4.y, diffuse_fp4.z) * diffuseFactor;
+    surface.alpha *= diffuse_fp4.w;
+  }
+
+  if (!material.useEmissiveTexture || disablePBRTextures)
+  {
+    surface.emissive = material.emissiveFactor;
+  }
+  else
+  {
+    const float4 emissive_fp4 = tex2D<float4>(material.emissiveTexture, texCoords.x, texCoords.y);
+    surface.emissive = make_float3(emissive_fp4.x, emissive_fp4.y, emissive_fp4.z) * material.emissiveFactor;
+  }
+
+  if (!material.useMetallicRoughnessTexture || disablePBRTextures)
+  {
+    surface.metallic = material.metallicFactor;
+    surface.roughness = material.roughnessFactor;
+  }
+  else
+  {
+    const float2 metallic_roughness_fp2 = tex2D<float2>(material.metallicRoughnessTexture, texCoords.x, texCoords.y);
+    surface.metallic = metallic_roughness_fp2.x * material.metallicFactor;
+    surface.roughness = metallic_roughness_fp2.y * material.roughnessFactor;
+  }
+
+  if (material.useNormalTexture && !disablePBRTextures)
+  {
+    const float4 normal_fp4 = tex2D<float4>(material.normalTexture, texCoords.x, texCoords.y);
+    surface.normal = compute_normal_space(normal, make_float3(normal_fp4.x, normal_fp4.y, normal_fp4.z));
+  }
+
+  surface.transmission = material.transmissionFactor;
+  surface.ior = material.ior;
+  return surface;
+}
+
+static __device__ __inline__ float cone_luminance(const float3 c)
+{
+  return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+}
+
+// Hybrid lobes: the specular and transmission lobes are cones, the diffuse lobe is a sampled direction as in the MC path.
+// One lobe is chosen per hit by its luminance weight. Rough surfaces fall back to the sampled BRDF.
+static __device__ __noinline__ void cone_cook_torrance_brdf(const float3 ray_d, const float3 normal, float3 &new_ray_dir, unsigned int &rndSeed, HybridRayPayload *payload)
+{
+  const PBRSurface surface = fetch_pbr_surface(normal);
+  if (!alpha_test(surface.alpha, surface.alphaMode, surface.alphaCutoff, rndSeed))
+  {
+    new_ray_dir = ray_d;
+    return;
+  }
   const float3 wo = normalize(-ray_d);
-  const float3 n = dot(wo, normal) < 0.0f ? -normal : normal;
+  if (surface.roughness > params.cone.maxRoughness)
+  {
+    const float3 nextScatter = sampled_microfacet_brdf(wo, surface.normal, surface.diffuse, surface.metallic, surface.roughness, surface.transmission, surface.ior, new_ray_dir, rndSeed, payload);
+    payload->bsdfValue = maxf3(nextScatter, make_float3(0.0));
+    payload->nextEmissive = surface.emissive;
+    return;
+  }
+  const float roughness = surface.roughness;
+  const float frontFacing = dot(wo, surface.normal);
+  const float3 n = frontFacing < 0.0f ? -surface.normal : surface.normal;
   const float nDotV = fmaxf(dot(n, wo), 1e-4f);
-  const float3 f0 = make_float3(0.04f) * (1.0f - metallic) + diffuse * metallic;
-  const float rx = 1.0f - roughness, ry = 0.0425f - 0.0275f * roughness, rz = 1.04f - 0.572f * roughness, rw = 0.022f * roughness - 0.04f;
-  const float a004 = fminf(rx * rx, exp2f(-9.28f * nDotV)) * rx + ry;
-  payload->bsdfValue = f0 * (rz - 1.04f * a004) + make_float3(rw + 1.04f * a004);
-  payload->nextEmissive = material.emissiveFactor;
-  payload->coneSpreadAdd = params.coneParams.y * roughness * roughness;
+  const float3 f0 = make_float3(0.04f) * (1.0f - surface.metallic) + surface.diffuse * surface.metallic;
+  const float2 dfg = dfgLookup(nDotV, roughness);
+  const float3 specW = f0 * dfg.x + make_float3(dfg.y);
+  const float3 notSpec = (make_float3(1.0f) - specW) * surface.diffuse * (1.0f - surface.metallic);
+  const float3 diffW = notSpec * (1.0f - surface.transmission);
+  const float3 transW = notSpec * surface.transmission;
+  const float specL = cone_luminance(specW);
+  const float diffL = cone_luminance(diffW);
+  const float transL = cone_luminance(transW);
+  const float sumL = specL + diffL + transL;
+  const float pSpec = sumL > 0.0f ? specL / sumL : 1.0f;
+  const float pDiff = sumL > 0.0f ? diffL / sumL : 0.0f;
+  const float pTrans = sumL > 0.0f ? transL / sumL : 0.0f;
+
+  const uint3 idx = optixGetLaunchIndex();
+  uint3 rngKey;
+  if (params.useRayIds)
+  {
+    const uint2 ids = getRayIds();
+    rngKey = make_uint3(ids.x, ids.y + payload->sampleIndex, payload->pbrNumBounces);
+  }
+  else
+  {
+    rngKey = make_uint3(idx.x, idx.y, getFrameNumber() + payload->sampleIndex + payload->pbrNumBounces);
+  }
+  const float3 rand = rnd_pcg3d(rngKey);
+
+  payload->nextEmissive = surface.emissive;
   payload->pbrNumBounces = payload->pbrNumBounces + 1;
-  new_ray_dir = 2.0f * dot(n, wo) * n - wo;
+  const bool chooseSpec = rand.z < pSpec || (pDiff <= 0.0f && pTrans <= 0.0f);
+  if (chooseSpec)
+  {
+    payload->bsdfValue = specW / pSpec;
+    payload->coneSpreadAdd = params.cone.spreadPerAlpha * roughness * roughness;
+    new_ray_dir = 2.0f * dot(n, wo) * n - wo;
+  }
+  else if (rand.z < pSpec + pDiff || pTrans <= 0.0f)
+  {
+    const float3 L = importance_sample_diffuse_ggx(surface.normal, rand.y, rand.x);
+    const float3 H = normalize(wo + L);
+    const float3 F = fresnel_schlick(positive_dot(wo, H), f0);
+    payload->bsdfValue = (make_float3(1.0f) - F) * ((1.0f - surface.metallic) * (1.0f - surface.transmission)) * surface.diffuse / pDiff;
+    payload->coneSpreadAdd = 0.0f;
+    new_ray_dir = L;
+  }
+  else
+  {
+    const float eta = frontFacing >= 0.0f ? 1.0f / surface.ior : surface.ior;
+    const float3 refracted = pbr_refract(-wo, n, eta);
+    const bool totalInternal = dot(refracted, refracted) == 0.0f;
+    payload->bsdfValue = transW / pTrans;
+    payload->coneSpreadAdd = params.cone.spreadPerAlpha * roughness * roughness;
+    new_ray_dir = totalInternal ? 2.0f * dot(n, wo) * n - wo : refracted;
+  }
 }
 
 #endif

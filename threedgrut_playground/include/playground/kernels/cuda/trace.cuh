@@ -78,7 +78,33 @@ struct HybridRayPayload {
   float coneSigma;
   float coneSpread;
   float coneSpreadAdd;
+
+  // Sample index within this pixel's in-kernel sample loop (params.pixelMode); added to the frame number in RNG keys
+  unsigned int sampleIndex;
 };
+
+// This launch index's entry of params.pixelMode (see PlaygroundPipelineParameters); call only when it is set
+static __device__ __forceinline__ float pixelModeValue()
+{
+  const uint3 idx = optixGetLaunchIndex();
+  const uint3 dim = optixGetLaunchDimensions();
+  return params.pixelMode[(idx.z * dim.y + idx.y) * dim.x + idx.x];
+}
+
+// Cones are used when the option is set and, with a per-pixel mode, this pixel's mode is a cone; without one, when this
+// pixel is at or right of the split column
+static __device__ __forceinline__ bool coneActive()
+{
+  if (!(params.playgroundOpts & PGRNDRenderConeTracing)) return false;
+  if (params.pixelMode) return pixelModeValue() < 0.0f;
+  return (int)optixGetLaunchIndex().x >= params.cone.splitColumn;
+}
+
+// Largest cone std for this pixel: params.cone.maxSigma, or the per-pixel cap when params.pixelMode is set
+static __device__ __forceinline__ float coneCap()
+{
+  return params.pixelMode ? fminf(-pixelModeValue(), params.cone.maxSigma) : params.cone.maxSigma;
+}
 
 constexpr float epsT = 1e-9; // Minimal offset to ray t to avoid zero t
 constexpr float TRACE_MESH_TMIN = 1e-5;
@@ -258,9 +284,10 @@ static __device__ __inline__ void widenParticle(gaussianParticle_Parameters_0 &p
   particle.scale_0 = make_float3(sqrtf(w2.x), sqrtf(w2.y), sqrtf(w2.z));
 }
 
-// same as traceVolumetricGS, but with every particle widened by the cone stddev at its distance, capped at some coneParams.z value.
+// same as traceVolumetricGS, but with every particle widened by the cone stddev at its distance, capped at params.cone.maxSigma.
 static __device__ __inline__ void traceVolumetricGSCone(RayData &rayData, const float3 &rayOrigin, const float3 &rayDirection, const float tmin, const float tmax, const float coneSigma, const float coneSpread)
 {
+  const float cap = coneCap();
   float rayTransmittance = 1.0f - rayData.density;
   float2 minMaxT = intersectAABB(params.aabb, rayOrigin, rayDirection);
   minMaxT.x = fmaxf(minMaxT.x, tmin);
@@ -283,7 +310,7 @@ static __device__ __inline__ void traceVolumetricGSCone(RayData &rayData, const 
       {
         gaussianParticle_Parameters_0 particle = particleDensityParameters(rayHit.particleId, {{(gaussianParticle_RawParameters_0 *)params.particleDensity, nullptr, true}});
         const float t = fmaxf(dot(particle.position_0 - rayOrigin, rayDirection), 0.0f);
-        widenParticle(particle, rayDirection, fminf(coneSigma + coneSpread * t, params.coneParams.z));
+        widenParticle(particle, rayDirection, fminf(coneSigma + coneSpread * t, cap));
         float alpha, depth;
         float3 canonicalIntersection;
         if (particleDensityHit(rayOrigin, rayDirection, particle, &alpha, &depth, &canonicalIntersection, false, &unusedNormal))
@@ -292,6 +319,124 @@ static __device__ __inline__ void traceVolumetricGSCone(RayData &rayData, const 
           particleFeaturesIntegrateFwdFromBuffer(rayDirection, canonicalIntersection, hitWeight, rayHit.particleId, const_cast<TParticleFeatureElem *>(params.particleFeatures), params.sphDegree, &rayData.features);
         }
         rayLastHitDistance = fmaxf(rayLastHitDistance, rayHit.distance);
+      }
+    }
+  }
+  rayData.density = 1 - rayTransmittance;
+  rayData.rayLastHitDistance = rayLastHitDistance;
+}
+
+// Same as trace() of 3dgrtTracer.cuh, against the given acceleration structure instead of params.handle
+static __device__ __inline__ void traceHandle(OptixTraversableHandle handle, RayPayload &rayPayload, const float3 &rayOri, const float3 &rayDir, const float tmin, const float tmax)
+{
+  uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31;
+  r0 = r2 = r4 = r6 = r8 = r10 = r12 = r14 = r16 = r18 = r20 = r22 = r24 = r26 = r28 = r30 = RayHit::InvalidParticleId;
+  r1 = r3 = r5 = r7 = r9 = r11 = r13 = r15 = r17 = r19 = r21 = r23 = r25 = r27 = r29 = r31 = __float_as_int(RayHit::InfiniteDistance);
+  optixTrace(handle, rayOri, rayDir, tmin, tmax, 0.0f, OptixVisibilityMask(255), OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT | (PipelineParameters::SurfelPrimitive ? OPTIX_RAY_FLAG_NONE : OPTIX_RAY_FLAG_CULL_BACK_FACING_TRIANGLES), 0, 1, 0, r0, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17, r18, r19, r20, r21, r22, r23, r24, r25, r26, r27, r28, r29, r30, r31);
+  rayPayload[0] = {r0, __uint_as_float(r1)};
+  rayPayload[1] = {r2, __uint_as_float(r3)};
+  rayPayload[2] = {r4, __uint_as_float(r5)};
+  rayPayload[3] = {r6, __uint_as_float(r7)};
+  rayPayload[4] = {r8, __uint_as_float(r9)};
+  rayPayload[5] = {r10, __uint_as_float(r11)};
+  rayPayload[6] = {r12, __uint_as_float(r13)};
+  rayPayload[7] = {r14, __uint_as_float(r15)};
+  rayPayload[8] = {r16, __uint_as_float(r17)};
+  rayPayload[9] = {r18, __uint_as_float(r19)};
+  rayPayload[10] = {r20, __uint_as_float(r21)};
+  rayPayload[11] = {r22, __uint_as_float(r23)};
+  rayPayload[12] = {r24, __uint_as_float(r25)};
+  rayPayload[13] = {r26, __uint_as_float(r27)};
+  rayPayload[14] = {r28, __uint_as_float(r29)};
+  rayPayload[15] = {r30, __uint_as_float(r31)};
+}
+
+// Ray distance where the cone std coneSigma + coneSpread * t reaches sigma: -inf if already there, +inf if never
+static __device__ __inline__ float lodSigmaCrossing(const float sigma, const float coneSigma, const float coneSpread)
+{
+  if (sigma <= coneSigma) return -RayHit::InfiniteDistance;
+  return coneSpread > 0.0f ? (sigma - coneSigma) / coneSpread : RayHit::InfiniteDistance;
+}
+
+// Cone trace over the Gaussian LOD. [tmin, tmax] is split along t where the cone std crosses a band edge, and each piece
+// is traced against its slot's AS, front to back, with one transmittance. Slot 0 is the main BVH and integrates as
+// traceVolumetricGS (no widening). Other slots map AS-local hit ids through params.lod.nodeIndex and widen as
+// traceVolumetricGSCone. A hit belongs to a piece when its proxy's closest approach lies in it (the intersection
+// program rejects the rest), so a Gaussian in two slots can be counted twice or not at all at a band edge. The width
+// is taken at the Gaussian mean's projection, which can lie beyond the piece, so it is also clamped to the slot's
+// inflation: the proxy then always bounds the widened Gaussian.
+static __device__ __noinline__ void traceVolumetricGSConeLod(RayData &rayData, const float3 &rayOrigin, const float3 &rayDirection, const float tmin, const float tmax, const float coneSigma, const float coneSpread)
+{
+  float rayTransmittance = 1.0f - rayData.density;
+  float rayLastHitDistance = 0.0f;
+  float3 canonicalIntersection = make_float3(0.f);
+  float3 unusedNormal = make_float3(0.f);
+  RayPayload rayPayload;
+  // A per-pixel cap below the frame's cap ends the slot list at the slot whose band holds it: the slots are built for the
+  // frame's largest cap, and their inflation (>= the cap of every band they serve) still bounds the widened Gaussians
+  const float cap = coneCap();
+  int numSlots = params.lod.numSlots;
+  while ((numSlots > 1) && (params.lod.bandLower[numSlots - 1] >= cap)) numSlots--;
+  // A cap variant built for exactly this cap replaces the top slot, so this pixel traces what a frame capped here would
+  int topPhysical = numSlots - 1;
+  for (int m = 0; m < params.lod.numCapVariants; m++)
+  {
+    if ((params.lod.capValue[m] == cap) && (params.lod.capBand[m] == numSlots - 1)) topPhysical = MaxLodSlots + m;
+  }
+  float bandStart = tmin;
+  for (int s = 0; (s < numSlots) && (rayTransmittance > params.minTransmittance); s++)
+  {
+    // The piece ends where the next slot's band starts. Slots whose band ends before the piece start are skipped,
+    // so a slot's band effectively starts at the largest lower edge so far.
+    const float bandEnd = (s + 1 < numSlots) ? fminf(tmax, lodSigmaCrossing(params.lod.bandLower[s + 1], coneSigma, coneSpread)) : tmax;
+    if ((s > 0) && (bandEnd <= bandStart)) continue;
+    const int p = (s == numSlots - 1) ? topPhysical : s; // physical slot: s, or the cap variant serving it
+    const OptixTraversableHandle handle = s == 0 ? params.handle : params.lod.handles[p];
+    float2 minMaxT = intersectAABB(s == 0 ? params.aabb : params.lod.aabbs[p], rayOrigin, rayDirection);
+    minMaxT.x = fmaxf(minMaxT.x, bandStart);
+    minMaxT.y = fminf(minMaxT.y, bandEnd);
+    bandStart = fmaxf(bandStart, bandEnd);
+    rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
+    while ((rayLastHitDistance <= minMaxT.y) && (rayTransmittance > params.minTransmittance))
+    {
+      traceHandle(handle, rayPayload, rayOrigin, rayDirection, rayLastHitDistance + epsT, minMaxT.y + epsT);
+      if (rayPayload[0].particleId == RayHit::InvalidParticleId)
+      {
+        break;
+      }
+#pragma unroll
+      for (int i = 0; i < PipelineParameters::MaxNumHitPerTrace; i++)
+      {
+        const RayHit rayHit = rayPayload[i];
+        if ((rayHit.particleId != RayHit::InvalidParticleId) && (rayTransmittance > params.minTransmittance))
+        {
+          if (s == 0)
+          {
+#ifdef ENABLE_NORMALS
+            const float hitWeight = particleDensityProcessHitFwdFromBuffer(rayOrigin, rayDirection, rayHit.particleId, {{(gaussianParticle_RawParameters_0 *)params.particleDensity, nullptr, true}}, &rayTransmittance, &rayData.hitDistance, &canonicalIntersection, true, &rayData.normal);
+#else
+            const float hitWeight = particleDensityProcessHitFwdFromBuffer(rayOrigin, rayDirection, rayHit.particleId, {{(gaussianParticle_RawParameters_0 *)params.particleDensity, nullptr, true}}, &rayTransmittance, &rayData.hitDistance, &canonicalIntersection, false, nullptr);
+#endif
+            particleFeaturesIntegrateFwdFromBuffer(rayDirection, canonicalIntersection, hitWeight, rayHit.particleId, const_cast<TParticleFeatureElem *>(params.particleFeatures), params.sphDegree, &rayData.features);
+#ifdef ENABLE_HIT_COUNTS
+            rayData.hitCount += hitWeight > 0.f ? 1.0f : 0.f;
+#endif
+          }
+          else
+          {
+            const unsigned int particleId = params.lod.nodeIndex[params.lod.indexOffset[p] + rayHit.particleId];
+            gaussianParticle_Parameters_0 particle = particleDensityParameters(particleId, {{(gaussianParticle_RawParameters_0 *)params.particleDensity, nullptr, true}});
+            const float t = fmaxf(dot(particle.position_0 - rayOrigin, rayDirection), 0.0f);
+            widenParticle(particle, rayDirection, fminf(fminf(coneSigma + coneSpread * t, params.lod.inflation[p]), cap));
+            float alpha, depth;
+            if (particleDensityHit(rayOrigin, rayDirection, particle, &alpha, &depth, &canonicalIntersection, false, &unusedNormal))
+            {
+              const float hitWeight = particleDensityIntegrateHit(alpha, &rayTransmittance, depth, &rayData.hitDistance, false, unusedNormal, &unusedNormal);
+              particleFeaturesIntegrateFwdFromBuffer(rayDirection, canonicalIntersection, hitWeight, particleId, const_cast<TParticleFeatureElem *>(params.particleFeatures), params.sphDegree, &rayData.features);
+            }
+          }
+          rayLastHitDistance = fmaxf(rayLastHitDistance, rayHit.distance);
+        }
       }
     }
   }
@@ -315,7 +460,11 @@ static __device__ __forceinline__ float4 traceGaussians(
   // Copy RayData, to avoid writing the output buffer by this pass
   RayData prevRayData = rayData;
   setNextTraceState(PGRNDTraceRTGaussiansPass);
-  if (params.playgroundOpts & PGRNDRenderConeTracing)
+  if (coneActive() && params.lod.enabled)
+  {
+    traceVolumetricGSConeLod(rayData, rayOrigin, rayDirection, tmin, tmax, payload->coneSigma, payload->coneSpread);
+  }
+  else if (coneActive())
   {
     traceVolumetricGSCone(rayData, rayOrigin, rayDirection, tmin, tmax, payload->coneSigma, payload->coneSpread);
   }

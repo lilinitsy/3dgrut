@@ -40,6 +40,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("build_bvh", &OptixTracer::buildBVH)
       .def("trace_hybrid", &HybridOptixTracer::traceHybrid)
       .def("build_mesh_bvh", &HybridOptixTracer::buildMeshBVH)
+      .def("build_lod_bvh", &HybridOptixTracer::buildLodBVH)
+      .def("clear_lod_bvh", &HybridOptixTracer::clearLodBVH)
+      .def("lod_slot_inflations", &HybridOptixTracer::lodSlotInflations)
       .def("denoise", &HybridOptixTracer::denoise);
 
   py::class_<CPBRMaterial>(m, "CPBRMaterial")

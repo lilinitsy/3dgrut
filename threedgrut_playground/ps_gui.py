@@ -55,6 +55,8 @@ class Playground:
         """ When this flag is toggled on, the state of the canvas have changed and it needs to be re-rendered """
         self.is_running = True
         self.is_force_canvas_dirty = False
+        # Render every frame from scratch with one sample per pixel (no accumulation), to see per-frame noise
+        self.live_single_frames = False
         self.controller_type = "Turntable"
         self.gui_aux_fields = dict()
         self.density_buffer = copy.deepcopy(self.scene_mog.density)  # For slicing planes
@@ -243,10 +245,22 @@ class Playground:
         elif style == "density":
             self.update_data_on_device(self.viz_render_scalar_buffer, sple_odns)
 
+    def _view_camera_preset(self, camera):
+        """Move the viewer camera to a ``CameraPreset`` (eye, target and vertical FOV)."""
+        ps.look_at(camera.eye, camera.at)
+        window_w, window_h = ps.get_window_size()
+        ps.set_view_camera_parameters(
+            ps.CameraParameters(
+                ps.CameraIntrinsics(fov_vertical_deg=camera.fov_deg, aspect=window_w / window_h),
+                ps.get_view_camera_parameters().get_extrinsics(),
+            )
+        )
+        self.is_force_canvas_dirty = True
+
     def is_dirty(self, camera: kaolin.render.camera.Camera):
         """Returns true if the state of the scene have changed since last time the canvas was rendered."""
         # Force dirty flag is on or engine specifies canvas is dirty
-        return self.is_force_canvas_dirty or self.engine.is_dirty(camera)
+        return self.is_force_canvas_dirty or self.live_single_frames or self.engine.is_dirty(camera)
 
     def _draw_preset_settings_widget(self):
         psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
@@ -395,6 +409,15 @@ class Playground:
             )
             self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
 
+            settings_changed, self.live_single_frames = psim.Checkbox(
+                "Live single frames (no accumulation)", self.live_single_frames
+            )
+            if settings_changed and self.live_single_frames:
+                self.engine.use_optix_denoiser = False  # show raw frames; the denoiser can be switched back on
+            self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+            if self.live_single_frames:
+                psim.TextUnformatted("  (every frame is one sample per pixel: what one real-time frame looks like)")
+
             settings_changed, self.engine.use_cone_tracing = psim.Checkbox(
                 "Cone Tracing (test)", self.engine.use_cone_tracing
             )
@@ -413,6 +436,42 @@ class Playground:
                     flags=psim.ImGuiSliderFlags_Logarithmic,
                 )
                 self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                if self.engine.use_gaussian_lod:
+                    top = self.engine.gaussian_lod_top_sigma()
+                    psim.TextUnformatted(f"  (with LOD, a cap above the top band is clamped to {top:g})")
+                settings_changed, self.engine.cone_max_roughness = psim.SliderFloat(
+                    "Cone Max Roughness", self.engine.cone_max_roughness, v_min=0.0, v_max=1.0
+                )
+                self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                settings_changed, self.engine.use_gaussian_lod = psim.Checkbox(
+                    "Gaussian LOD (builds on first use)", self.engine.use_gaussian_lod
+                )
+                self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                if self.engine.use_gaussian_lod:
+                    settings_changed, self.engine.lod_thin_sigma = psim.SliderFloat(
+                        "LOD Thin Std (no widening below)", self.engine.lod_thin_sigma, v_min=0.0, v_max=0.005
+                    )
+                    self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                elif self.engine.gaussian_lod_resident:
+                    psim.TextUnformatted("  (LOD structures stay in GPU memory until the scene changes)")
+                settings_changed, self.engine.cone_split = psim.SliderFloat(
+                    "Split (MC shading left | cone right)", self.engine.cone_split, v_min=0.0, v_max=1.0
+                )
+                if self.engine.use_gaussian_lod:
+                    psim.TextUnformatted("  (left half uses the plain BVH, the same as cone off; 1.0 = no cones)")
+                else:
+                    psim.TextUnformatted("  (left half also uses the cone's inflated BVH; 1.0 = no cones, plain BVH)")
+                self.is_force_canvas_dirty = self.is_force_canvas_dirty or settings_changed
+                if psim.Button("Load roughness ladder (replaces objects)"):
+                    from threedgrut_playground.adaptive.evaluation.cone_equal_time import load_ladder
+
+                    self._view_camera_preset(load_ladder(self.engine))
+                if psim.Button("Load cone test scene (replaces objects)"):
+                    from threedgrut_playground.adaptive.evaluation.cone_scene import place_cone_ramp
+
+                    camera = place_cone_ramp(self.engine)  # blocks for about ten seconds
+                    self.engine.camera_fov = camera.fov_deg
+                    self._view_camera_preset(camera)
                 psim.PopItemWidth()
 
             psim.PopItemWidth()
@@ -625,6 +684,7 @@ class Playground:
             n = p1.new_tensor(self.slice_plane_normal)[None, enabled_planes]
             is_inside = (torch.sum((p1[:, None] - p0) * n, dim=-1) > 0).all(dim=1)
             self.scene_mog.density[~is_inside] = -100000  # Empty density
+        self.engine.invalidate_gaussian_lod()  # the LOD is rebuilt (uncached) from the sliced densities
         self.is_force_canvas_dirty = True
 
     def _draw_antialiasing_widget(self):

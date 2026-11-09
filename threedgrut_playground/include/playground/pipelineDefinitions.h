@@ -38,7 +38,7 @@ enum PlaygroundRenderOptions {
       1 << 1, // Disable Gaussian tracing -- only meshes will be rendered
   PGRNDRenderDisablePBRTextures =
       1 << 2, // Disable PBR textures, use base material values only
-  PGRNDRenderConeTracing = 1 << 3 // Rays carry cones; PBR reflections trace one widened cone, see coneParams
+  PGRNDRenderConeTracing = 1 << 3 // Rays carry cones; PBR reflections trace one widened cone, see ConeParams
 };
 
 enum GltfAlphaMode {

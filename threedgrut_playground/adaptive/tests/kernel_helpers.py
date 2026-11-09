@@ -307,6 +307,9 @@ def trace_playground(
     ray_max_t: Optional[torch.Tensor] = None,
     ray_pixel_id: Optional[torch.Tensor] = None,
     ray_sample_index: Optional[torch.Tensor] = None,
+    cone_params: Optional[torch.Tensor] = None,
+    lod=None,
+    lod_params: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Call ``Tracer.render_playground`` directly, with the engine's stacked mesh fields.
 
@@ -321,6 +324,12 @@ def trace_playground(
         id_kwargs["ray_pixel_id"] = ray_pixel_id
     if ray_sample_index is not None:
         id_kwargs["ray_sample_index"] = ray_sample_index
+    if cone_params is not None:
+        id_kwargs["cone_params"] = cone_params
+    if lod is not None:
+        id_kwargs["lod"] = lod
+    if lod_params is not None:
+        id_kwargs["lod_params"] = lod_params
     return engine.tracer.render_playground(
         gaussians=engine.scene_mog,
         ray_o=rays_o.clone(),

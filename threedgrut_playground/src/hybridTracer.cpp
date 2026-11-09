@@ -99,6 +99,7 @@ HybridOptixTracer::~HybridOptixTracer(void) {
 
   if (_playgroundState)
     _playgroundState->denoiser.release(); // Release if allocated
+  releaseLodSlots(true);
 
   OPTIX_CHECK_NOTHROW(
       optixPipelineDestroy(_playgroundState->pipelineTriGSTracing));
@@ -122,6 +123,82 @@ HybridOptixTracer::~HybridOptixTracer(void) {
       cudaFree(reinterpret_cast<void *>(_playgroundState->paramsDevice)));
 
   delete _playgroundState;
+}
+
+void HybridOptixTracer::releaseLodSlots(bool nothrow)
+{
+  for (LodSlot &slot : _lodSlots)
+  {
+    if (nothrow)
+    {
+      CUDA_CHECK_NOTHROW(cudaFree(reinterpret_cast<void *>(slot.gasBuffer)));
+      CUDA_CHECK_NOTHROW(cudaFree(reinterpret_cast<void *>(slot.instances)));
+    }
+    else
+    {
+      cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
+      CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void *>(slot.gasBuffer), cudaStream));
+      CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void *>(slot.instances), cudaStream));
+    }
+    slot = LodSlot();
+  }
+}
+
+void HybridOptixTracer::clearLodBVH() { releaseLodSlots(false); }
+
+std::vector<float> HybridOptixTracer::lodSlotInflations() const
+{
+  std::vector<float> inflations(MaxLodPhysicalSlots, -1.0f);
+  for (int s = 1; s < MaxLodPhysicalSlots; s++)
+  {
+    const LodSlot &slot = _lodSlots[s];
+    if ((slot.handle != 0) && (slot.unitGas == _state->iasBuffer)) inflations[s] = slot.inflation;
+  }
+  return inflations;
+}
+
+// Builds slot `slot` with the base buildBVH, by swapping the slot's storage into _state for the call and the main BVH
+// back afterwards. Per slot: the IAS (gasHandle, gasBuffer), its instance buffer (gPrimAABB), its bounds (gasAABB) and
+// gNum, so a later refit of the main BVH still sees its own count. Shared: the scratch buffer gasBufferTmp, and the
+// unit-primitive GAS in iasBuffer, which every buildBVH rebuilds in place. Its size depends only on the fixed one-AABB
+// build input, so it is never reallocated after the first build and the instances of earlier slots stay valid;
+// traceHybrid still checks that iasBuffer has not moved. Everything runs on the current stream, so no trace overlaps a
+// rebuild. Rebuilding a built slot reuses its buffers when they are large enough.
+void HybridOptixTracer::buildLodBVH(int slot, torch::Tensor mogPos, torch::Tensor mogRot, torch::Tensor mogScl, torch::Tensor mogDns, float inflation)
+{
+  TORCH_CHECK(slot >= 1 && slot < MaxLodPhysicalSlots, "LOD slot must be in [1, ", MaxLodPhysicalSlots, "), got ", slot);
+  TORCH_CHECK(std::isfinite(inflation) && inflation >= 0.0f, "LOD slot ", slot, " inflation must be finite and >= 0, got ", inflation);
+  TORCH_CHECK(_state->gPrimType == MOGTracingInstances, "LOD slots need the 'instances' primitive type");
+  TORCH_CHECK(mogPos.size(0) > 0, "LOD slot ", slot, " has no Gaussians");
+  LodSlot &lodSlot = _lodSlots[slot];
+  auto swapSlot = [&]()
+  {
+    std::swap(_state->gasHandle, lodSlot.handle);
+    std::swap(_state->gasBuffer, lodSlot.gasBuffer);
+    std::swap(_state->gasBufferSz, lodSlot.gasBufferSz);
+    std::swap(_state->gPrimAABB, lodSlot.instances);
+    std::swap(_state->gPrimAABBSz, lodSlot.instancesSz);
+    std::swap(_state->gasAABB, lodSlot.aabb);
+    std::swap(_state->gNum, lodSlot.count);
+  };
+  swapSlot();
+  try
+  {
+    buildBVH(mogPos, mogRot, mogScl, mogDns, 1, false);
+    // The bounds reach the host by an async copy: finish it before _state->gasAABB goes back to the main BVH
+    CUDA_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream()));
+  }
+  catch (...)
+  {
+    swapSlot();
+    lodSlot.handle = 0;
+    lodSlot.count = 0;
+    lodSlot.inflation = -1.0f;
+    throw;
+  }
+  swapSlot();
+  lodSlot.unitGas = _state->iasBuffer;
+  lodSlot.inflation = inflation;
 }
 
 void HybridOptixTracer::reallocateMeshPrimGeomBuffer(cudaStream_t cudaStream) {
@@ -328,7 +405,8 @@ HybridOptixTracer::traceHybrid(
     torch::Tensor refractiveIndex, torch::Tensor envmap,
     torch::Tensor envmapOffset, const unsigned int maxPBRBounces,
     torch::Tensor rayPixelId, torch::Tensor raySampleIndex,
-    torch::Tensor coneParams) {
+    torch::Tensor coneParams, torch::Tensor lodParams,
+    torch::Tensor lodNodeIndex, torch::Tensor pixelMode) {
 
   // ----- 3dgrt launch params -----
   const torch::TensorOptions opts =
@@ -409,8 +487,88 @@ HybridOptixTracer::traceHybrid(
   paramsHost.aovFirstHitTransmittance = packed_accessor32<float, 4>(aovFirstHitTransmittance);
   paramsHost.aovNumBounces = packed_accessor32<int32_t, 4>(aovNumBounces);
   paramsHost.aovGaussDepth = packed_accessor32<float, 4>(aovGaussDepth);
+  TORCH_CHECK(coneParams.numel() == 5 && coneParams.scalar_type() == torch::kFloat32 && coneParams.device().is_cpu(), "coneParams must be a CPU float32 tensor with 5 elements");
   const float *cone = coneParams.data_ptr<float>();
-  paramsHost.coneParams = make_float3(cone[0], cone[1], cone[2]);
+  paramsHost.cone.pixelSpread = cone[0];
+  paramsHost.cone.spreadPerAlpha = cone[1];
+  paramsHost.cone.maxSigma = cone[2];
+  paramsHost.cone.maxRoughness = cone[3];
+  paramsHost.cone.splitColumn = (int)cone[4];
+  // pixelMode: empty (off) or a [B,H,W] CUDA float32 tensor matching the rays, see PlaygroundPipelineParameters
+  if (pixelMode.numel() == 0)
+  {
+    paramsHost.pixelMode = nullptr;
+  }
+  else
+  {
+    TORCH_CHECK(pixelMode.scalar_type() == torch::kFloat32 && pixelMode.is_cuda() && pixelMode.is_contiguous(), "pixelMode must be a contiguous CUDA float32 tensor");
+    TORCH_CHECK(pixelMode.dim() == 3 && pixelMode.size(0) == rayOri.size(0) && pixelMode.size(1) == rayOri.size(1) && pixelMode.size(2) == rayOri.size(2), "pixelMode must be [B,H,W] like the rays");
+    paramsHost.pixelMode = pixelMode.data_ptr<float>();
+  }
+  // lodParams: [enabled, S, band lower edges (S), index table offsets (S)], optionally followed by
+  // [M, (cap, band slot) x M] cap variants, see LodParams. Each slot's inflation comes from the slot itself
+  // (buildLodBVH), so the widening bound is always the one its proxies were built with
+  TORCH_CHECK(lodParams.dim() == 1 && lodParams.numel() >= 2 && lodParams.scalar_type() == torch::kFloat32 && lodParams.device().is_cpu() && lodParams.is_contiguous(), "lodParams must be a contiguous 1D CPU float32 tensor with at least 2 elements");
+  const float *lod = lodParams.data_ptr<float>();
+  // Range-check S as a float first: casting a NaN or out-of-range float to int is undefined
+  TORCH_CHECK(std::isfinite(lod[1]) && lod[1] >= 0.0f && lod[1] <= (float)MaxLodSlots && lod[1] == std::floor(lod[1]), "lodParams S must be an integer in [0, ", MaxLodSlots, "], got ", lod[1]);
+  const int numLodSlots = (int)lod[1];
+  const int64_t baseNumel = 2 + 2 * numLodSlots;
+  int numCapVariants = 0;
+  if (lodParams.numel() > baseNumel)
+  {
+    const float m = lod[baseNumel];
+    TORCH_CHECK(std::isfinite(m) && m >= 0.0f && m <= (float)MaxLodCapVariants && m == std::floor(m), "lodParams M must be an integer in [0, ", MaxLodCapVariants, "], got ", m);
+    numCapVariants = (int)m;
+  }
+  TORCH_CHECK(lodParams.numel() == baseNumel || lodParams.numel() == baseNumel + 1 + 2 * numCapVariants, "lodParams must hold 2 + 2 * S elements, or 3 + 2 * S + 2 * M with cap variants; got S = ", numLodSlots, " and ", lodParams.numel(), " elements");
+  std::memset(&paramsHost.lod, 0, sizeof(LodParams));
+  paramsHost.lod.enabled = lod[0] != 0.0f ? 1 : 0;
+  if (paramsHost.lod.enabled)
+  {
+    TORCH_CHECK(numLodSlots >= 1, "enabled lodParams need at least one slot");
+    TORCH_CHECK(lodNodeIndex.scalar_type() == torch::kInt32 && lodNodeIndex.is_cuda() && lodNodeIndex.is_contiguous(), "lodNodeIndex must be a contiguous CUDA int32 tensor");
+    paramsHost.lod.numSlots = numLodSlots;
+    paramsHost.lod.nodeIndex = lodNodeIndex.data_ptr<int32_t>();
+    for (int s = 0; s < numLodSlots; s++)
+    {
+      const float lower = lod[2 + s];
+      TORCH_CHECK(!std::isnan(lower), "LOD slot ", s, " band lower edge is NaN");
+      paramsHost.lod.bandLower[s] = lower;
+      if (s == 0) continue;
+      const LodSlot &slot = _lodSlots[s];
+      TORCH_CHECK(slot.handle != 0, "LOD slot ", s, " is enabled but not built");
+      TORCH_CHECK(slot.unitGas == _state->iasBuffer, "LOD slot ", s, " points to a unit-primitive GAS that has moved; rebuild it");
+      const float offset = lod[2 + numLodSlots + s];
+      TORCH_CHECK(std::isfinite(offset) && offset >= 0.0f && offset == std::floor(offset) && (double)offset + slot.count <= (double)lodNodeIndex.numel(), "LOD slot ", s, " index table [", offset, ", ", offset, " + ", slot.count, ") is outside lodNodeIndex (", lodNodeIndex.numel(), " entries)");
+      TORCH_CHECK(std::isfinite(slot.inflation) && slot.inflation >= 0.0f, "LOD slot ", s, " has no valid inflation (", slot.inflation, ")");
+      paramsHost.lod.handles[s] = slot.handle;
+      paramsHost.lod.aabbs[s] = slot.aabb;
+      paramsHost.lod.indexOffset[s] = (int)offset;
+      paramsHost.lod.inflation[s] = slot.inflation;
+    }
+    paramsHost.lod.numCapVariants = numCapVariants;
+    for (int m = 0; m < numCapVariants; m++)
+    {
+      const float cap = lod[baseNumel + 1 + 2 * m];
+      const float band = lod[baseNumel + 2 + 2 * m];
+      TORCH_CHECK(std::isfinite(cap) && cap > 0.0f, "LOD cap variant ", m, " cap must be finite and > 0, got ", cap);
+      TORCH_CHECK(std::isfinite(band) && band >= 1.0f && band < (float)numLodSlots && band == std::floor(band), "LOD cap variant ", m, " band slot must be an integer in [1, S), got ", band);
+      const int b = (int)band;
+      const int p = MaxLodSlots + m;
+      const LodSlot &slot = _lodSlots[p];
+      TORCH_CHECK(slot.handle != 0, "LOD cap variant ", m, " is enabled but not built");
+      TORCH_CHECK(slot.unitGas == _state->iasBuffer, "LOD cap variant ", m, " points to a unit-primitive GAS that has moved; rebuild it");
+      TORCH_CHECK(slot.count == _lodSlots[b].count, "LOD cap variant ", m, " holds ", slot.count, " Gaussians but its band slot ", b, " holds ", _lodSlots[b].count);
+      TORCH_CHECK(slot.inflation == cap, "LOD cap variant ", m, " was built with inflation ", slot.inflation, ", not its cap ", cap);
+      paramsHost.lod.capValue[m] = cap;
+      paramsHost.lod.capBand[m] = b;
+      paramsHost.lod.handles[p] = slot.handle;
+      paramsHost.lod.aabbs[p] = slot.aabb;
+      paramsHost.lod.indexOffset[p] = paramsHost.lod.indexOffset[b];
+      paramsHost.lod.inflation[p] = slot.inflation;
+    }
+  }
   CudaTexture2DFloat4Object cuEnvMap = CudaTexture2DFloat4Object();
   int envmapHeight = envmap.size(0);
   int envmapWidth = envmap.size(1);

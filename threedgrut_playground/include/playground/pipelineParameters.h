@@ -46,6 +46,40 @@ struct alignas(16) PBRMaterial {
                // --> mem 16 byte aligned
 };
 
+// Cone tracing parameters
+struct ConeParams
+{
+  float pixelSpread;    // camera ray spread (rad, as a Gaussian std)
+  float spreadPerAlpha; // spread added per unit GGX alpha
+  float maxSigma;       // max cone std (world)
+  float maxRoughness;   // roughness above which the cone is not used
+  int splitColumn;      // cones are used for pixels with launch x >= splitColumn
+};
+
+// Gaussian LOD cone tracing: one instance AS per width band ("slot"), all indexing one particle buffer
+constexpr int MaxLodSlots = 10;
+// Cap variants: for a per-pixel mode with several cone caps, the slot whose band holds cap c is also built inflated
+// by exactly c, so a pixel capped at c traces what a frame capped at c would (its top slot is not inflated to the
+// band edge or to the frame's largest cap). They live in physical slots MaxLodSlots .. MaxLodSlots + 7.
+constexpr int MaxLodCapVariants = 8;
+constexpr int MaxLodPhysicalSlots = MaxLodSlots + MaxLodCapVariants;
+
+struct LodParams
+{
+  OptixTraversableHandle handles[MaxLodPhysicalSlots]; // slot 0 unused: it traces params.handle
+  OptixAabb aabbs[MaxLodPhysicalSlots];                // scene bounds of each slot's AS, slot 0 unused (params.aabb)
+  const int32_t *nodeIndex;                            // concatenated slot index tables: AS-local hit id -> particle
+  float bandLower[MaxLodSlots];                        // lower edge of each slot's width band, slot 0 = 0
+  float inflation[MaxLodPhysicalSlots]; // std each slot's proxies were inflated by: its widening bound, slot 0 unused
+  int indexOffset[MaxLodPhysicalSlots]; // start of each slot's table in nodeIndex, slot 0 unused
+  int numSlots;
+  int enabled;
+  // Cap variant m (physical slot MaxLodSlots + m) serves pixels capped at exactly capValue[m], in place of slot capBand[m]
+  float capValue[MaxLodCapVariants];
+  int capBand[MaxLodCapVariants];
+  int numCapVariants;
+};
+
 struct PlaygroundPipelineParameters : PipelineParameters {
   PackedTensorAccessor32<float, 3> rayMaxT; ///< ray max t for termination
   cudaTextureObject_t envmap; // for envmaps and solid background color
@@ -94,6 +128,15 @@ struct PlaygroundPipelineParameters : PipelineParameters {
   PackedTensorAccessor32<int32_t, 4> aovFirstPrimType;       // C=1, 0 if no hit
   PackedTensorAccessor32<int32_t, 4> aovNumBounces;          // C=1
 
-  // PGRNDRenderConeTracing: x = camera ray spread (rad, as a Gaussian std), y = spread added per unit GGX alpha, z = max cone std (world)
-  float3 coneParams;
+  // PGRNDRenderConeTracing
+  ConeParams cone;
+
+  // Gaussian LOD for cones, used only when cone tracing is active and lod.enabled
+  LodParams lod;
+
+  // Per-pixel render mode, [B,H,W] float32, or nullptr (then splitColumn decides as before). A value n > 0 renders n
+  // Monte Carlo samples looped in raygen and averaged (sample i uses the random numbers of frame frameNumber + i, or
+  // of sample index + i with ray ids); a value -c < 0 renders one cone with its std capped at min(c, cone.maxSigma);
+  // 0 renders nothing (black, alpha 0). Cone values need PGRNDRenderConeTracing.
+  const float *pixelMode;
 };

@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <array>
 #include <cuda_runtime.h>
 #include <optix.h>
 #include <string>
@@ -102,6 +103,24 @@ protected:
     OptixDenoiserWrapper denoiser;
   } *_playgroundState;
 
+  // One Gaussian LOD slot (slot >= 1): its own instance AS and instance buffer. The unit-primitive GAS the instances
+  // point to is the base tracer's shared one in _state->iasBuffer.
+  struct LodSlot
+  {
+    OptixTraversableHandle handle = 0;
+    CUdeviceptr gasBuffer = 0; /// IAS output
+    size_t gasBufferSz = 0;
+    CUdeviceptr instances = 0; /// OptixInstance array, the IAS build input
+    size_t instancesSz = 0;
+    OptixAabb aabb = {};
+    uint32_t count = 0;      /// number of instances = length of the slot's index table
+    CUdeviceptr unitGas = 0; /// _state->iasBuffer when the slot was built; the instances point into it
+    float inflation = -1.0f; /// std the proxies were inflated by (the kernel's widening bound), -1 if not built
+  };
+  std::array<LodSlot, MaxLodPhysicalSlots> _lodSlots; // slots 1..MaxLodSlots-1, then the cap variants
+
+  void releaseLodSlots(bool nothrow);
+
   void reallocateMeshPrimGeomBuffer(cudaStream_t stream);
   void reallocatePlaygroundParamsDevice(size_t sz, cudaStream_t stream);
 
@@ -118,6 +137,19 @@ public:
 
   void buildMeshBVH(torch::Tensor meshVerts, torch::Tensor meshFaces,
                     unsigned int rebuild, bool allow_update);
+
+  // Builds the instance AS of LOD slot `slot` (1 <= slot < MaxLodSlots) over the given Gaussians, into the slot's own
+  // storage. `mogScl` holds the scales already inflated by `inflation`, which is kept with the slot: the kernel never
+  // widens the slot's Gaussians beyond it. The main BVH (params.handle) is left untouched.
+  void buildLodBVH(int slot, torch::Tensor mogPos, torch::Tensor mogRot,
+                   torch::Tensor mogScl, torch::Tensor mogDns, float inflation);
+
+  // Frees every LOD slot
+  void clearLodBVH();
+
+  // The inflation each slot 0..MaxLodSlots-1 was built with, or -1 for a slot that is not built or whose instances
+  // point to a unit-primitive GAS that has moved (slot 0 is the main BVH: always -1)
+  std::vector<float> lodSlotInflations() const;
 
   void syncMaterials(PlaygroundPipelineParameters &params,
                      const std::vector<CPBRMaterial> &materials,
@@ -141,7 +173,9 @@ public:
               bool shouldSyncMaterials, torch::Tensor refractiveIndex,
               torch::Tensor envmap, torch::Tensor envmapOffset,
               const unsigned int maxPBRBounces, torch::Tensor rayPixelId,
-              torch::Tensor raySampleIndex, torch::Tensor coneParams);
+              torch::Tensor raySampleIndex, torch::Tensor coneParams,
+              torch::Tensor lodParams, torch::Tensor lodNodeIndex,
+              torch::Tensor pixelMode);
 
   torch::Tensor denoise(torch::Tensor rayRad);
 };
