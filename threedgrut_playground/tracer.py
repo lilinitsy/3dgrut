@@ -204,6 +204,41 @@ class Tracer:
         cpbr_material.ior = pbr_mat.ior or 0.0
         return cpbr_material
 
+    _PARTICLE_SOURCE_FIELDS = ("positions", "rotation", "scale", "density", "features_albedo", "features_specular")
+
+    def _particle_buffers(self, gaussians):
+        """``(particle_density, features)`` for the trace, rebuilt only when the Gaussians change.
+
+        Activating and concatenating 1.25M Gaussians costs several ms per frame, so the result is kept while every
+        source tensor is the same object at the same in-place version, and the active SH degree is unchanged.
+        """
+        fields = [getattr(gaussians, name, None) for name in self._PARTICLE_SOURCE_FIELDS]
+        key = tuple((t, t._version) if isinstance(t, torch.Tensor) else (None, -1) for t in fields)
+        key += ((id(gaussians), gaussians.n_active_features, bool(gaussians.progressive_training)),)
+        cached = getattr(self, "_particle_cache", None)
+        if cached is not None and len(cached[0]) == len(key):
+            same = all(a[0] is b[0] and a[1] == b[1] for a, b in zip(cached[0][:-1], key[:-1]))
+            if same and cached[0][-1] == key[-1]:
+                return cached[1], cached[2]
+        with torch.no_grad():
+            features = gaussians.get_features()
+            if gaussians.progressive_training:
+                features = features * gaussians.get_active_feature_mask()
+            mog_dns = gaussians.get_density().contiguous()
+            particle_density = torch.concat(
+                [
+                    gaussians.positions.contiguous(),
+                    mog_dns,
+                    gaussians.get_rotation().contiguous(),
+                    gaussians.get_scale().contiguous(),
+                    torch.zeros_like(mog_dns),
+                ],
+                dim=1,
+            ).contiguous()
+            features = features.contiguous()
+        self._particle_cache = (key, particle_density, features)
+        return particle_density, features
+
     def render_playground(
         self,
         gaussians,
@@ -300,15 +335,7 @@ class Tracer:
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
             # The feature mask zeros out feature dims the model shouldn't use yet.
             # That introduces a curriculum way of optimizing the model
-            features = gaussians.get_features()
-            if gaussians.progressive_training:
-                features *= gaussians.get_active_feature_mask()
-
-            mog_pos = gaussians.positions.contiguous()
-            mog_dns = gaussians.get_density().contiguous()
-            mog_rot = gaussians.get_rotation().contiguous()
-            mog_scl = gaussians.get_scale().contiguous()
-            particle_density = torch.concat([mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1)
+            particle_density, features = self._particle_buffers(gaussians)
             sph_degree = gaussians.n_active_features
             min_transmittance = self.conf.render.min_transmittance
             envmap_offset = envmap_offset.contiguous()

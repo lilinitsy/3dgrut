@@ -37,7 +37,8 @@ enum PlaygroundRenderOptions {
   PGRNDRenderDisableGaussianTracing =
       1 << 1, // Disable Gaussian tracing -- only meshes will be rendered
   PGRNDRenderDisablePBRTextures =
-      1 << 2 // Disable PBR textures, use base material values only
+      1 << 2, // Disable PBR textures, use base material values only
+  PGRNDRenderCostAov = 1 << 5 // raygen writes the SM clock cycles it spent on its pixel to rayHitsCount
 };
 
 enum GltfAlphaMode {

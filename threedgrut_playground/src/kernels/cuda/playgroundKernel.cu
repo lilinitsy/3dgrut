@@ -38,6 +38,7 @@ constexpr float REFRACTION_EPS_SHIFT =
 
 extern "C" __global__ void __raygen__rg() {
 
+  const long long costStart = clock64(); // PGRNDRenderCostAov: this pixel's cycles, written at the end
   const uint3 idx = optixGetLaunchIndex();
   const uint3 dim = optixGetLaunchDimensions();
   float3 rayOrigin = params.rayWorldOrigin(idx);
@@ -180,6 +181,10 @@ extern "C" __global__ void __raygen__rg() {
   writeRadianceDensityToOutputBuffer(rgba);
   writeUpdatedRaysToBuffer(lastRayOri, lastRayDir);
   writeAovsToBuffer(payload, aovGaussDepth, aovFirstHitTransmittance);
+  if (params.playgroundOpts & PGRNDRenderCostAov)
+  {
+    params.rayHitsCount[idx.z][ry][rx][0] = (float)(clock64() - costStart);
+  }
 }
 
 static __device__ __inline__ bool refract(float3 &out_dir, const float3 ray_d,

@@ -17,6 +17,7 @@
 #ifdef __PLAYGROUND__MODE__
 
 #include <optix.h>
+#include <playground/kernels/cuda/dfgLut.cuh>
 #include <playground/kernels/cuda/mathUtils.cuh>
 #include <playground/kernels/cuda/rng.cuh>
 #include <playground/kernels/cuda/trace.cuh>
@@ -267,7 +268,24 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
   const float random_theta_seed = rand.y;
   const float ray_prob = rand.z;
 
-  if ((ray_prob < 0.5f) && ((2.0 * ray_prob) < transmission)) { // Transmissive
+  
+  // Lobe choice proportional to a lobe's expected weight (split-sum dfg table)
+  float pTrans, pDiff;
+  
+  const float3 f0w = lerp(make_float3(0.16f * fresnel_reflect * fresnel_reflect), base_color, metalness);
+  const float2 dfg = dfgLookup(fmaxf(fabsf(dot(normal, wo)), 1e-4f), roughness);
+  const float3 specW = f0w * dfg.x + make_float3(dfg.y);
+  const float3 notSpec = (make_float3(1.0f) - specW) * base_color;
+  const float3 diffW = notSpec * ((1.0f - metalness) * (1.0f - transmission));
+  const float3 transW = notSpec * transmission;
+  const float3 lum = make_float3(0.2126f, 0.7152f, 0.0722f);
+  const float specL = fmaxf(dot(specW, lum), 0.0f), diffL = fmaxf(dot(diffW, lum), 0.0f);
+  const float transL = fmaxf(dot(transW, lum), 0.0f), sumL = specL + diffL + transL;
+  pTrans = sumL > 0.0f ? transL / sumL : 0.0f;
+  pDiff = sumL > 0.0f ? diffL / sumL : 0.0f;
+  
+
+  if (ray_prob < pTrans) { // Transmissive
     float frontFacing = dot(wo, normal);
     float3 forwardNormal;
     float eta;
@@ -300,8 +318,8 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     float G = geometry_smith(fnormal_dot_wo, fnormal_dot_L, roughness);
     out_factor = base_color * (make_float3(1.0) - F) * G * wo_dot_H /
                  fmaxf((fnormal_dot_H * fnormal_dot_wo), 0.001);
-  } else if ((ray_prob < 0.5f) &&
-             ((2.0 * ray_prob) >= transmission)) { // Diffuse
+    out_factor *= transmission / pTrans;
+  } else if (ray_prob < pTrans + pDiff) { // Diffuse
     // Importance sampling diffuse
     L = importance_sample_diffuse_ggx(normal, random_theta_seed,
                                       random_phi_seed);
@@ -322,7 +340,7 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     // no diffuse for metals
     not_spec *= (1.0 - metalness);
 
-    out_factor = not_spec * base_color;
+    out_factor = not_spec * base_color * ((1.0f - transmission) / pDiff);
   } else {
     // Specular
     // important sample GGX
@@ -346,9 +364,9 @@ sampled_microfacet_brdf(const float3 wo, const float3 normal,
     float G = geometry_smith(normal_dot_wo, normal_dot_L, roughness);
     out_factor =
         F * G * wo_dot_H / fmaxf((normal_dot_H * normal_dot_wo), 0.001);
+    out_factor /= fmaxf(1.0f - pTrans - pDiff, 1e-6f);
   }
 
-  out_factor *= 2.0; // compensate for splitting diffuse and specular
   next_ray_dir = L;
   payload->pbrNumBounces = payload->pbrNumBounces + 1;
   return make_float3(out_factor.x, out_factor.y, out_factor.z);

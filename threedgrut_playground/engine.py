@@ -126,6 +126,7 @@ class OptixPlaygroundRenderOptions(IntEnum):
     SMOOTH_NORMALS = 1  # Use smooth interpolated normals for shading
     DISABLE_GAUSSIAN_TRACING = 2  # Disable Gaussian volumetric tracing
     DISABLE_PBR_TEXTURES = 4  # Disable PBR textures
+    COST_AOV = 32  # hits_count holds the SM clock cycles each pixel's raygen spent (a per-pixel cost map)
 
 
 class OptixPrimitiveTypes(IntEnum):
@@ -837,6 +838,9 @@ class Engine3DGRUT:
         self.gamma_correction = 1.0
         """ Maximum number of PBR material bounces (transmissions & refractions, reflections) """
         self.max_pbr_bounces = 15
+
+        # Per-pixel cost map: with cost_aov on, the output's hits_count holds the SM clock cycles each pixel's raygen spent, default to having off
+        self.cost_aov = False
         """ If enabled, will use the optix denoiser as post-processing """
         self.use_optix_denoiser = True
         """ Enables / disables gaussian rendering """
@@ -944,6 +948,8 @@ class Engine3DGRUT:
             playground_render_opts |= OptixPlaygroundRenderOptions.DISABLE_GAUSSIAN_TRACING
         if self.primitives.disable_pbr_textures:
             playground_render_opts |= OptixPlaygroundRenderOptions.DISABLE_PBR_TEXTURES
+        if self.cost_aov:
+            playground_render_opts |= OptixPlaygroundRenderOptions.COST_AOV
 
         self.primitives.rebuild_bvh_if_needed()
 
